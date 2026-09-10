@@ -1,0 +1,2101 @@
+namespace MeshGeneration.SurfacePartitioning
+{
+    // All search edits are provisional: a rejected branch rolls back to its entry count.
+    // Integral areas let us evaluate cuts without constructing cell sets or meshes.
+    internal sealed class BalancedPartitionPlanner
+    {
+        private readonly bool[,] _mask;
+        private readonly int[,] _areas;
+        private readonly int _columns;
+        private readonly int _rows;
+        private readonly int _minimumArea;
+        private readonly int _maximumArea;
+        private readonly float _maxAspect;
+        private readonly float _maxLegAspect;
+        private readonly float _minLegRatio;
+        private readonly int _targetComplex;
+        private readonly int _seed;
+        private readonly List<Shape> _pieces = new List<Shape>();
+        private readonly HashSet<(RectInt, int, int)> _failed = new HashSet<(RectInt, int, int)>();
+        private readonly Dictionary<(RectInt, int, int), Shape[]> _solved = new Dictionary<(RectInt, int, int), Shape[]>();
+        private int _remainingNodes;
+
+        internal BalancedPartitionPlanner(bool[,] mask, int columns, int rows, int count,
+            float complexRatio, float maxLegAspect, float maxAspect, int seed,
+            float minAreaRatio, float maxAreaRatio, float minLegRatio)
+        {
+            _mask = mask;
+            _columns = columns;
+            _rows = rows;
+            _areas = new int[columns + 1, rows + 1];
+            for (int y = 0; y < rows; y++)
+            for (int x = 0; x < columns; x++)
+                _areas[x + 1, y + 1] = _areas[x, y + 1] + _areas[x + 1, y] - _areas[x, y] +
+                    (mask == null || mask[x, y] ? 1 : 0);
+            float average = _areas[columns, rows] / (float)count;
+            _minimumArea = Mathf.Max(1, Mathf.CeilToInt(average * minAreaRatio - 0.00001f));
+            _maximumArea = Mathf.FloorToInt(average * maxAreaRatio + 0.00001f);
+            _maxAspect = maxAspect;
+            _maxLegAspect = maxLegAspect;
+            _minLegRatio = minLegRatio;
+            _targetComplex = Mathf.Clamp(Mathf.RoundToInt(count * complexRatio), 0, count);
+            _seed = seed;
+            _remainingNodes = Math.Max(4096, count * 64);
+        }
+
+        internal bool TryBuild(int count, out SurfacePartition partition, bool redistributeSeams = true)
+        {
+            partition = null;
+            if (_maximumArea < _minimumArea) return false;
+            if (!Split(new RectInt(0, 0, _columns, _rows), count, Mathf.Min(count / 2, (_targetComplex + 1) / 2)))
+                return false;
+            if (redistributeSeams) BreakContinuousSeams();
+            var regions = new List<SurfacePartitionRegion>(count);
+            foreach (Shape shape in _pieces)
+            {
+                var region = new SurfacePartitionRegion
+                {
+                    SourceRectangleCount = shape.Notch.width == 0 ? 1 : 2,
+                    MaxSourceRectangleAspect = shape.SourceAspect
+                };
+                for (int y = shape.Bounds.yMin; y < shape.Bounds.yMax; y++)
+                for (int x = shape.Bounds.xMin; x < shape.Bounds.xMax; x++)
+                    if (!shape.Notch.Contains(new Vector2Int(x, y)))
+                        region.Cells.Add(new Vector2Int(x, y));
+                regions.Add(region);
+            }
+            partition = new SurfacePartition(_columns, _rows, regions);
+            return true;
+        }
+
+        // Local transfers cross the original recursive cuts. Every transfer preserves the union
+        // and count, and is committed only when BOTH resulting shapes pass the same quality rules.
+        private void BreakContinuousSeams()
+        {
+            var owners = new int[_columns, _rows];
+            for (int y = 0; y < _rows; y++)
+            for (int x = 0; x < _columns; x++) owners[x, y] = -1;
+            for (int i = 0; i < _pieces.Count; i++)
+            {
+                Shape shape = _pieces[i];
+                for (int y = shape.Bounds.yMin; y < shape.Bounds.yMax; y++)
+                for (int x = shape.Bounds.xMin; x < shape.Bounds.xMax; x++)
+                    if (!shape.Notch.Contains(new Vector2Int(x, y))) owners[x, y] = i;
+            }
+            var seen = new HashSet<long>();
+            var pairs = new List<long>();
+            for (int y = 0; y < _rows; y++)
+            for (int x = 0; x < _columns; x++)
+            {
+                if (x + 1 < _columns) AddPair(owners[x, y], owners[x + 1, y], seen, pairs);
+                if (y + 1 < _rows) AddPair(owners[x, y], owners[x, y + 1], seen, pairs);
+            }
+            pairs.Sort((a, b) => Noise((int)(a >> 32), (int)a, 211).CompareTo(Noise((int)(b >> 32), (int)b, 211)));
+            foreach (long pair in pairs)
+            {
+                int a = (int)(pair >> 32), b = (int)pair;
+                if (Noise(a, b, 307) < 0.5f) { int swap = a; a = b; b = swap; }
+                if (!TryRetile(a, b) && !TryTransfer(a, b)) TryTransfer(b, a);
+            }
+        }
+
+        private static void AddPair(int a, int b, HashSet<long> seen, List<long> pairs)
+        {
+            if (a < 0 || b < 0 || a == b) return;
+            long key = ((long)Math.Min(a, b) << 32) | (uint)Math.Max(a, b);
+            if (seen.Add(key)) pairs.Add(key);
+        }
+
+        private bool TryRetile(int first, int second)
+        {
+            Shape a = _pieces[first], b = _pieces[second];
+            int oldComplex = (a.Notch.width > 0 ? 1 : 0) + (b.Notch.width > 0 ? 1 : 0);
+            int minX = Math.Min(a.Bounds.xMin, b.Bounds.xMin), minY = Math.Min(a.Bounds.yMin, b.Bounds.yMin);
+            var bounds = new RectInt(minX, minY, Math.Max(a.Bounds.xMax, b.Bounds.xMax) - minX,
+                Math.Max(a.Bounds.yMax, b.Bounds.yMax) - minY);
+            bool verticalContact = a.Bounds.xMax == b.Bounds.xMin || b.Bounds.xMax == a.Bounds.xMin;
+            // Cut across the old contact, so pieces can span a former parent-block boundary.
+            bool vertical = !verticalContact;
+            int length = vertical ? bounds.width : bounds.height;
+            Func<RectInt, int> query = r => CountInShape(a, r) + CountInShape(b, r);
+            int total = a.Area + b.Area;
+            int middle = length / 2;
+            for (int offset = 0; offset < length; offset++)
+            {
+                int cut = middle + ((offset & 1) == 0 ? offset / 2 : -(offset + 1) / 2);
+                if (cut <= 0 || cut >= length) continue;
+                Divide(bounds, vertical, cut, out RectInt left, out RectInt right);
+                int area = query(left);
+                if (area < _minimumArea || area > _maximumArea || total - area < _minimumArea || total - area > _maximumArea) continue;
+                if (!TryRecognizeShape(left, area, query, out Shape nextA) ||
+                    !TryRecognizeShape(right, total - area, query, out Shape nextB)) continue;
+                int complex = (nextA.Notch.width > 0 ? 1 : 0) + (nextB.Notch.width > 0 ? 1 : 0);
+                if (complex < oldComplex || (_targetComplex == 0 && complex > oldComplex)) continue;
+                _pieces[first] = nextA;
+                _pieces[second] = nextB;
+                return true;
+            }
+            return false;
+        }
+
+        private bool TryRecognizeShape(RectInt bounds, int area, Func<RectInt, int> query, out Shape result)
+        {
+            while (bounds.width > 1 && query(new RectInt(bounds.xMin, bounds.yMin, 1, bounds.height)) == 0) bounds.xMin++;
+            while (bounds.width > 1 && query(new RectInt(bounds.xMax - 1, bounds.yMin, 1, bounds.height)) == 0) bounds.xMax--;
+            while (bounds.height > 1 && query(new RectInt(bounds.xMin, bounds.yMin, bounds.width, 1)) == 0) bounds.yMin++;
+            while (bounds.height > 1 && query(new RectInt(bounds.xMin, bounds.yMax - 1, bounds.width, 1)) == 0) bounds.yMax--;
+            if (area == bounds.width * bounds.height) return ValidateShape(bounds, default, out result);
+            for (int corner = 0; corner < 4; corner++)
+            {
+                bool right = (corner & 1) != 0, top = (corner & 2) != 0;
+                int x = right ? bounds.xMax - 1 : bounds.xMin, y = top ? bounds.yMax - 1 : bounds.yMin;
+                int w = 0, h = 0;
+                while (w < bounds.width && query(new RectInt(x + (right ? -w : w), y, 1, 1)) == 0) w++;
+                while (h < bounds.height && query(new RectInt(x, y + (top ? -h : h), 1, 1)) == 0) h++;
+                if (w == 0 || h == 0 || w == bounds.width || h == bounds.height) continue;
+                RectInt notch = new RectInt(right ? bounds.xMax - w : bounds.xMin, top ? bounds.yMax - h : bounds.yMin, w, h);
+                if (bounds.width * bounds.height - w * h == area && query(notch) == 0 &&
+                    ValidateShape(bounds, notch, out result)) return true;
+            }
+            result = default;
+            return false;
+        }
+
+        private bool TryTransfer(int donor, int receiver)
+        {
+            Shape a = _pieces[donor], b = _pieces[receiver];
+            for (int axis = 0; axis < 2; axis++)
+            {
+                bool vertical = axis == 0;
+                int aMin = vertical ? a.Bounds.xMin : a.Bounds.yMin;
+                int aMax = vertical ? a.Bounds.xMax : a.Bounds.yMax;
+                int bMin = vertical ? b.Bounds.xMin : b.Bounds.yMin;
+                int bMax = vertical ? b.Bounds.xMax : b.Bounds.yMax;
+                if (aMax != bMin && aMin != bMax) continue;
+                bool positive = aMax == bMin;
+                int start = Math.Max(vertical ? a.Bounds.yMin : a.Bounds.xMin, vertical ? b.Bounds.yMin : b.Bounds.xMin);
+                int end = Math.Min(vertical ? a.Bounds.yMax : a.Bounds.xMax, vertical ? b.Bounds.yMax : b.Bounds.xMax);
+                int shared = end - start;
+                for (int variant = 0; variant < 3; variant++)
+                {
+                    int length = variant == 0 ? shared : Math.Max(1, shared / 2);
+                    if (length <= 0) continue;
+                    int offset = variant == 2 ? end - length : start;
+                    int across = positive ? aMax - 1 : aMin;
+                    RectInt patch = vertical ? new RectInt(across, offset, 1, length) : new RectInt(offset, across, length, 1);
+                    if (CountInShape(a, patch) != length) continue;
+                    if (!TryAdjustedShape(a, patch, false, out Shape nextA) ||
+                        !TryAdjustedShape(b, patch, true, out Shape nextB)) continue;
+                    int before = (a.Notch.width > 0 ? 1 : 0) + (b.Notch.width > 0 ? 1 : 0);
+                    int after = (nextA.Notch.width > 0 ? 1 : 0) + (nextB.Notch.width > 0 ? 1 : 0);
+                    if (after < before || (_targetComplex == 0 && after > before)) continue;
+                    _pieces[donor] = nextA;
+                    _pieces[receiver] = nextB;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private bool TryAdjustedShape(Shape source, RectInt patch, bool add, out Shape result)
+        {
+            RectInt bounds = source.Bounds;
+            if (add)
+            {
+                int x = Math.Min(bounds.xMin, patch.xMin), y = Math.Min(bounds.yMin, patch.yMin);
+                bounds = new RectInt(x, y, Math.Max(bounds.xMax, patch.xMax) - x, Math.Max(bounds.yMax, patch.yMax) - y);
+            }
+            while (bounds.width > 1 && AdjustedArea(source, patch, add, new RectInt(bounds.xMin, bounds.yMin, 1, bounds.height)) == 0) bounds.xMin++;
+            while (bounds.width > 1 && AdjustedArea(source, patch, add, new RectInt(bounds.xMax - 1, bounds.yMin, 1, bounds.height)) == 0) bounds.xMax--;
+            while (bounds.height > 1 && AdjustedArea(source, patch, add, new RectInt(bounds.xMin, bounds.yMin, bounds.width, 1)) == 0) bounds.yMin++;
+            while (bounds.height > 1 && AdjustedArea(source, patch, add, new RectInt(bounds.xMin, bounds.yMax - 1, bounds.width, 1)) == 0) bounds.yMax--;
+            int area = source.Area + (add ? 1 : -1) * patch.width * patch.height;
+            if (area == bounds.width * bounds.height) return ValidateShape(bounds, default, out result);
+            for (int corner = 0; corner < 4; corner++)
+            {
+                bool right = (corner & 1) != 0, top = (corner & 2) != 0;
+                int x = right ? bounds.xMax - 1 : bounds.xMin, y = top ? bounds.yMax - 1 : bounds.yMin;
+                int w = 0, h = 0;
+                while (w < bounds.width && AdjustedArea(source, patch, add, new RectInt(x + (right ? -w : w), y, 1, 1)) == 0) w++;
+                while (h < bounds.height && AdjustedArea(source, patch, add, new RectInt(x, y + (top ? -h : h), 1, 1)) == 0) h++;
+                if (w == 0 || h == 0 || w == bounds.width || h == bounds.height) continue;
+                RectInt notch = new RectInt(right ? bounds.xMax - w : bounds.xMin, top ? bounds.yMax - h : bounds.yMin, w, h);
+                if (bounds.width * bounds.height - w * h == area && AdjustedArea(source, patch, add, notch) == 0 &&
+                    ValidateShape(bounds, notch, out result)) return true;
+            }
+            result = default;
+            return false;
+        }
+        private static int AdjustedArea(Shape source, RectInt patch, bool add, RectInt query) =>
+            CountInShape(source, query) + (add ? 1 : -1) * IntersectionArea(patch, query);
+        private static int CountInShape(Shape shape, RectInt query) => IntersectionArea(shape.Bounds, query) - IntersectionArea(shape.Notch, query);
+        private static int IntersectionArea(RectInt a, RectInt b) => Math.Max(0, Math.Min(a.xMax, b.xMax) - Math.Max(a.xMin, b.xMin)) *
+            Math.Max(0, Math.Min(a.yMax, b.yMax) - Math.Max(a.yMin, b.yMin));
+
+        private bool Split(RectInt bounds, int count, int complexPairs)
+        {
+            if (--_remainingNodes < 0) return false;
+            int area = Area(bounds);
+            if (area < (long)count * _minimumArea || area > (long)count * _maximumArea)
+                return false;
+            bounds = Trim(bounds);
+            var key = (bounds, count, complexPairs);
+            if (_failed.Contains(key)) return false;
+            if (_solved.TryGetValue(key, out Shape[] solution))
+            {
+                _pieces.AddRange(solution);
+                return true;
+            }
+            int start = _pieces.Count;
+            if (count == 1)
+            {
+                if (TryShape(bounds, out Shape shape))
+                {
+                    _pieces.Add(shape);
+                    return true;
+                }
+                _failed.Add(key);
+                return false;
+            }
+
+            // A stepped cut tiles a rectangular block with two balanced L shapes.
+            // It neither adds/removes pieces nor changes the exterior boundary.
+            if (count == 2 && area == bounds.width * bounds.height &&
+                complexPairs > 0 &&
+                TrySteppedPair(bounds))
+                return true;
+
+            var candidates = new List<Cut>();
+            for (int axis = 0; axis < 2; axis++)
+            {
+                int length = axis == 0 ? bounds.width : bounds.height;
+                for (int cut = 1; cut < length; cut++)
+                {
+                    Divide(bounds, axis == 0, cut, out RectInt first, out RectInt second);
+                    int firstArea = Area(first);
+                    int secondArea = area - firstArea;
+                    int low = Math.Max(1, Math.Max(Mathf.CeilToInt(firstArea / (float)_maximumArea),
+                        count - secondArea / _minimumArea));
+                    int high = Math.Min(count - 1, Math.Min(firstArea / _minimumArea,
+                        count - Mathf.CeilToInt(secondArea / (float)_maximumArea)));
+                    if (low > high) continue;
+                    // Nearest quota first. Neighbour quotas remain candidates for irregular boundaries.
+                    int ideal = Mathf.Clamp(Mathf.RoundToInt(count * firstArea / (float)area), low, high);
+                    for (int n = Math.Max(low, ideal - 1); n <= Math.Min(high, ideal + 1); n++)
+                    {
+                        if (n == 1 && !TryShape(Trim(first), out _)) continue;
+                        if (count - n == 1 && !TryShape(Trim(second), out _)) continue;
+                        float balance = Mathf.Abs(firstArea / (float)n - secondArea / (float)(count - n)) /
+                            (area / (float)count);
+                        float compactness = Mathf.Max(Aspect(first) / n, Aspect(second) / (count - n));
+                        float score = balance * 1.5f + compactness + Mathf.Abs(n * 2 - count) / (float)count * 0.25f;
+                        score += Noise(bounds.x + cut, bounds.y + axis, n) * 0.6f;
+                        candidates.Add(new Cut(first, second, n, score));
+                    }
+                }
+            }
+            candidates.Sort((a, b) => a.Score.CompareTo(b.Score));
+            foreach (Cut cut in candidates)
+            {
+                // Apportion complexity spatially instead of exhausting a global counter in traversal order.
+                int capacityFirst = cut.Count / 2;
+                int capacitySecond = (count - cut.Count) / 2;
+                int available = Math.Min(complexPairs, capacityFirst + capacitySecond);
+                int pairsFirst = Mathf.Clamp(Mathf.RoundToInt(available * cut.Count / (float)count),
+                    Math.Max(0, available - capacitySecond), Math.Min(available, capacityFirst));
+                if (Split(cut.First, cut.Count, pairsFirst) && Split(cut.Second, count - cut.Count, available - pairsFirst))
+                {
+                    if (count <= 32)
+                    {
+                        var saved = new Shape[count];
+                        _pieces.CopyTo(start, saved, 0, count);
+                        _solved[key] = saved;
+                    }
+                    return true;
+                }
+                if (_pieces.Count > start) _pieces.RemoveRange(start, _pieces.Count - start);
+                if (_remainingNodes <= 0) break;
+            }
+            _failed.Add(key);
+            return false;
+        }
+
+        private bool TrySteppedPair(RectInt bounds)
+        {
+            Shape bestFirst = default;
+            Shape bestSecond = default;
+            float best = float.MaxValue;
+            for (int axis = 0; axis < 2; axis++)
+            {
+                int width = axis == 0 ? bounds.width : bounds.height;
+                int height = axis == 0 ? bounds.height : bounds.width;
+                // A small fixed family of substantial steps, not a search over all cell pairs.
+                for (int variant = 0; variant < 3; variant++)
+                {
+                    int a = Mathf.Max(1, Mathf.RoundToInt(width * (0.3f + variant * 0.05f)));
+                    int b = width - a;
+                    if (a >= b || b >= width) continue;
+                    int y = Mathf.Clamp(Mathf.RoundToInt(height * (0.35f + 0.15f * variant)), 1, height - 1);
+                    if (y < 1) continue;
+                    RectInt firstBounds = Orient(bounds, axis, 0, 0, b, height);
+                    RectInt firstNotch = Orient(bounds, axis, a, y, b - a, height - y);
+                    RectInt secondBounds = Orient(bounds, axis, a, 0, width - a, height);
+                    RectInt secondNotch = Orient(bounds, axis, a, 0, b - a, y);
+                    if (!ValidateShape(firstBounds, firstNotch, out Shape first) ||
+                        !ValidateShape(secondBounds, secondNotch, out Shape second)) continue;
+                    float score = Mathf.Abs(first.Area - second.Area) / (float)(first.Area + second.Area) +
+                        Noise(bounds.x + a, bounds.y + y, axis + variant);
+                    if (score >= best) continue;
+                    best = score;
+                    bestFirst = first;
+                    bestSecond = second;
+                }
+            }
+            if (best == float.MaxValue) return false;
+            bool mirrorX = Noise(bounds.x, bounds.y, 71) < 0.5f;
+            bool mirrorY = Noise(bounds.x, bounds.y, 113) < 0.5f;
+            _pieces.Add(Mirror(bestFirst, bounds, mirrorX, mirrorY));
+            _pieces.Add(Mirror(bestSecond, bounds, mirrorX, mirrorY));
+            return true;
+        }
+
+        private static Shape Mirror(Shape shape, RectInt block, bool x, bool y)
+        {
+            RectInt bounds = shape.Bounds;
+            RectInt notch = shape.Notch;
+            if (x)
+            {
+                bounds.x = block.xMin + block.xMax - shape.Bounds.xMax;
+                notch.x = block.xMin + block.xMax - shape.Notch.xMax;
+            }
+            if (y)
+            {
+                bounds.y = block.yMin + block.yMax - shape.Bounds.yMax;
+                notch.y = block.yMin + block.yMax - shape.Notch.yMax;
+            }
+            return new Shape(bounds, notch, shape.Area, shape.SourceAspect);
+        }
+
+        private bool TryShape(RectInt bounds, out Shape shape)
+        {
+            int area = Area(bounds);
+            if (area == bounds.width * bounds.height)
+                return ValidateShape(bounds, default, out shape);
+            // A legal L is exactly a bounding rectangle minus one corner rectangle.
+            // Empty strips give its notch dimensions; the integral count verifies every cell.
+            for (int corner = 0; corner < 4; corner++)
+            {
+                bool right = (corner & 1) != 0;
+                bool top = (corner & 2) != 0;
+                int x = right ? bounds.xMax - 1 : bounds.xMin;
+                int y = top ? bounds.yMax - 1 : bounds.yMin;
+                if (Occupied(x, y)) continue;
+                int w = 0;
+                while (w < bounds.width && !Occupied(x + (right ? -w : w), y)) w++;
+                int h = 0;
+                while (h < bounds.height && !Occupied(x, y + (top ? -h : h))) h++;
+                var notch = new RectInt(right ? bounds.xMax - w : bounds.xMin,
+                    top ? bounds.yMax - h : bounds.yMin, w, h);
+                if (w * h == bounds.width * bounds.height - area && Area(notch) == 0 &&
+                    ValidateShape(bounds, notch, out shape)) return true;
+            }
+            shape = default;
+            return false;
+        }
+
+        private bool ValidateShape(RectInt bounds, RectInt notch, out Shape shape)
+        {
+            shape = default;
+            int area = bounds.width * bounds.height - notch.width * notch.height;
+            if (area < _minimumArea || area > _maximumArea || Aspect(bounds) > _maxAspect + 0.0001f)
+                return false;
+            float sourceAspect = Aspect(bounds);
+            if (notch.width > 0)
+            {
+                int verticalThickness = bounds.width - notch.width;
+                int horizontalThickness = bounds.height - notch.height;
+                float minimumThickness = Mathf.Sqrt(area) * _minLegRatio;
+                if (verticalThickness < minimumThickness || horizontalThickness < minimumThickness ||
+                    notch.height / (float)verticalThickness > _maxLegAspect ||
+                    notch.width / (float)horizontalThickness > _maxLegAspect)
+                    return false;
+                // Either of the two exact, disjoint rectangle decompositions may certify an L.
+                float first = Mathf.Max(Ratio(bounds.width, horizontalThickness),
+                    Ratio(verticalThickness, notch.height));
+                float second = Mathf.Max(Ratio(verticalThickness, bounds.height),
+                    Ratio(notch.width, horizontalThickness));
+                sourceAspect = Mathf.Min(first, second);
+                if (sourceAspect > _maxLegAspect + 0.0001f) return false;
+            }
+            shape = new Shape(bounds, notch, area, sourceAspect);
+            return true;
+        }
+
+        private bool Occupied(int x, int y) => _mask == null || _mask[x, y];
+        private int Area(RectInt r) => _areas[r.xMax, r.yMax] - _areas[r.xMin, r.yMax] -
+            _areas[r.xMax, r.yMin] + _areas[r.xMin, r.yMin];
+        private RectInt Trim(RectInt r)
+        {
+            while (r.width > 1 && Area(new RectInt(r.xMin, r.yMin, 1, r.height)) == 0) r.xMin++;
+            while (r.width > 1 && Area(new RectInt(r.xMax - 1, r.yMin, 1, r.height)) == 0) r.xMax--;
+            while (r.height > 1 && Area(new RectInt(r.xMin, r.yMin, r.width, 1)) == 0) r.yMin++;
+            while (r.height > 1 && Area(new RectInt(r.xMin, r.yMax - 1, r.width, 1)) == 0) r.yMax--;
+            return r;
+        }
+        private static float Aspect(RectInt r) => Ratio(r.width, r.height);
+        private static float Ratio(int width, int height) => Mathf.Max(width, height) / (float)Mathf.Max(1, Mathf.Min(width, height));
+        private float Noise(int x, int y, int salt)
+        {
+            unchecked
+            {
+                uint h = (uint)(_seed ^ x * 73856093 ^ y * 19349663 ^ salt * 83492791);
+                h ^= h >> 16; h *= 0x7feb352d; h ^= h >> 15;
+                return (h & 0xffffff) / 16777216f;
+            }
+        }
+        private static RectInt Orient(RectInt origin, int axis, int x, int y, int w, int h) => axis == 0
+            ? new RectInt(origin.x + x, origin.y + y, w, h)
+            : new RectInt(origin.x + y, origin.y + x, h, w);
+        private static void Divide(RectInt r, bool vertical, int cut, out RectInt a, out RectInt b)
+        {
+            a = new RectInt(r.x, r.y, vertical ? cut : r.width, vertical ? r.height : cut);
+            b = vertical ? new RectInt(r.x + cut, r.y, r.width - cut, r.height)
+                : new RectInt(r.x, r.y + cut, r.width, r.height - cut);
+        }
+        private readonly struct Shape
+        {
+            internal readonly RectInt Bounds, Notch;
+            internal readonly int Area;
+            internal readonly float SourceAspect;
+            internal Shape(RectInt bounds, RectInt notch, int area, float aspect)
+            { Bounds = bounds; Notch = notch; Area = area; SourceAspect = aspect; }
+        }
+        private readonly struct Cut
+        {
+            internal readonly RectInt First, Second;
+            internal readonly int Count;
+            internal readonly float Score;
+            internal Cut(RectInt first, RectInt second, int count, float score)
+            { First = first; Second = second; Count = count; Score = score; }
+        }
+    }
+}
+
+namespace MeshGeneration.SurfacePartitioning
+{
+    internal static class MaskedSurfacePartitionGenerator
+    {
+        private const int QualitySteps = 12;
+
+        public static SurfacePartition Generate(IReadOnlyList<Vector2> footprint, Bounds bounds,
+            int pieceCount, float complexPieceRatio, int maxRectanglesPerPiece,
+            float maxComplexLegAspect, float maxPieceAspect, int targetCellsPerRectangle, int seed,
+            float minAreaRatio = SurfacePartitionDefinition.DefaultMinAreaRatio,
+            float maxAreaRatio = SurfacePartitionDefinition.DefaultMaxAreaRatio,
+            float minLegRatio = SurfacePartitionDefinition.DefaultMinLegRatio)
+        {
+            if (TryGenerate(footprint, bounds, pieceCount, complexPieceRatio, maxRectanglesPerPiece,
+                maxComplexLegAspect, maxPieceAspect, targetCellsPerRectangle, seed,
+                minAreaRatio, maxAreaRatio, minLegRatio, out SurfacePartition partition)) return partition;
+            throw new InvalidOperationException($"No feasible masked partition for {pieceCount} pieces with the specified quality limits.");
+        }
+
+        internal static bool TryGenerate(IReadOnlyList<Vector2> footprint, Bounds bounds,
+            int pieceCount, float complexPieceRatio, int maxRectanglesPerPiece,
+            float maxComplexLegAspect, float maxPieceAspect, int targetCellsPerRectangle, int seed,
+            float minAreaRatio, float maxAreaRatio, float minLegRatio, out SurfacePartition partition)
+        {
+            partition = null;
+            if (footprint == null || footprint.Count < 3 || bounds.size.x <= 0f || bounds.size.z <= 0f ||
+                !SurfacePartitionGenerator.ValidSettings(pieceCount, minAreaRatio, maxAreaRatio, minLegRatio))
+                return false;
+            float footprintArea = Mathf.Abs(SourceFootprintExtractor.SignedArea(footprint));
+            float boundsArea = bounds.size.x * bounds.size.z;
+            float fillRatio = Mathf.Clamp(footprintArea / boundsArea, 0.01f, 1f);
+            float aspect = bounds.size.x / bounds.size.z;
+            for (int qualityStep = 0; qualityStep < QualitySteps; qualityStep++)
+            {
+                float quality = Mathf.Lerp(1f, 0.18f, qualityStep / (float)(QualitySteps - 1));
+                long requested = Math.Max(pieceCount,
+                    (long)Math.Ceiling(pieceCount * (double)targetCellsPerRectangle * quality * quality / fillRatio));
+                ResolveGrid(aspect, requested, out int columns, out int rows);
+                if ((long)columns * rows > 4000000) return false;
+                bool[,] mask = Rasterize(footprint, bounds, columns, rows, out int occupied);
+                if (occupied < pieceCount || !IsConnected(mask, columns, rows, occupied)) continue;
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    var planner = new BalancedPartitionPlanner(mask, columns, rows, pieceCount,
+                        maxRectanglesPerPiece < 2 ? 0f : complexPieceRatio, maxComplexLegAspect, maxPieceAspect,
+                        unchecked(seed + attempt * 16777619), minAreaRatio, maxAreaRatio, minLegRatio);
+                    if (planner.TryBuild(pieceCount, out partition)) return true;
+                }
+            }
+            return false;
+        }
+
+        internal static bool[,] Rasterize(IReadOnlyList<Vector2> footprint, Bounds bounds,
+            int columns, int rows, out int occupiedCount)
+        {
+            bool[,] mask = new bool[columns, rows];
+            occupiedCount = 0;
+            float cellWidth = bounds.size.x / columns;
+            float cellDepth = bounds.size.z / rows;
+            for (int z = 0; z < rows; z++)
+            for (int x = 0; x < columns; x++)
+            {
+                Vector2 center = new Vector2(
+                    bounds.min.x + (x + 0.5f) * cellWidth,
+                    bounds.min.z + (z + 0.5f) * cellDepth);
+                if (!SourceFootprintExtractor.ContainsPoint(footprint, center))
+                    continue;
+                mask[x, z] = true;
+                occupiedCount++;
+            }
+            return mask;
+        }
+
+        private static bool IsConnected(bool[,] mask, int columns, int rows, int occupiedCount)
+        {
+            if (occupiedCount == 0)
+                return false;
+            Queue<Vector2Int> frontier = new Queue<Vector2Int>();
+            bool[,] visited = new bool[columns, rows];
+            for (int z = 0; z < rows && frontier.Count == 0; z++)
+            for (int x = 0; x < columns; x++)
+            {
+                if (!mask[x, z]) continue;
+                frontier.Enqueue(new Vector2Int(x, z));
+                visited[x, z] = true;
+                break;
+            }
+
+            int count = 0;
+            Vector2Int[] directions = { Vector2Int.left, Vector2Int.right, Vector2Int.up, Vector2Int.down };
+            while (frontier.Count > 0)
+            {
+                Vector2Int current = frontier.Dequeue();
+                count++;
+                foreach (Vector2Int direction in directions)
+                {
+                    Vector2Int next = current + direction;
+                    if (next.x < 0 || next.y < 0 || next.x >= columns || next.y >= rows ||
+                        visited[next.x, next.y] || !mask[next.x, next.y])
+                        continue;
+                    visited[next.x, next.y] = true;
+                    frontier.Enqueue(next);
+                }
+            }
+            return count == occupiedCount;
+        }
+
+        private static void ResolveGrid(float aspect, long requiredCells, out int columns, out int rows)
+        {
+            columns = Mathf.Max(1, Mathf.CeilToInt(Mathf.Sqrt(requiredCells * aspect)));
+            rows = Mathf.Max(1, Mathf.CeilToInt(requiredCells / (float)columns));
+            while ((long)columns * rows < requiredCells)
+                rows++;
+        }
+
+    }
+}
+
+namespace MeshGeneration.SurfacePartitioning
+{
+    internal readonly struct PartitionLabelPlacement
+    {
+        public readonly Vector3 Position;
+        public readonly Vector2 TextArea;
+        public readonly bool IsVertical;
+
+        public PartitionLabelPlacement(Vector3 position, Vector2 textArea, bool isVertical)
+        {
+            Position = position;
+            TextArea = textArea;
+            IsVertical = isVertical;
+        }
+    }
+
+    internal static class PartitionLabelPlacementCalculator
+    {
+        public static PartitionLabelPlacement Calculate(
+            HashSet<Vector2Int> cells,
+            int columns,
+            int rows,
+            Bounds bounds,
+            float normalizedGap,
+            float normalizedBevel,
+            float paddingFraction,
+            float surfaceOffset)
+        {
+            RectInt rectangle = FindLargestContainedRectangle(cells, columns, rows);
+            float cellWidth = bounds.size.x / columns;
+            float cellDepth = bounds.size.z / rows;
+            float rawWidth = rectangle.width * cellWidth;
+            float rawDepth = rectangle.height * cellDepth;
+            float shortestSurfaceSide = Mathf.Min(bounds.size.x, bounds.size.z);
+            float shortestCellSide = Mathf.Min(cellWidth, cellDepth);
+            float halfGap = Mathf.Min(normalizedGap * shortestSurfaceSide * 0.5f, shortestCellSide * 0.22f);
+            float bevel = Mathf.Min(normalizedBevel * shortestSurfaceSide, bounds.size.y * 0.45f);
+            bevel = Mathf.Min(bevel, shortestCellSide * 0.2f);
+            float margin = halfGap + bevel + Mathf.Min(rawWidth, rawDepth) * paddingFraction;
+            float safeWidth = Mathf.Max(rawWidth - margin * 2f, rawWidth * 0.12f);
+            float safeDepth = Mathf.Max(rawDepth - margin * 2f, rawDepth * 0.12f);
+            bool vertical = safeDepth > safeWidth * 1.12f;
+
+            float centerX = bounds.min.x + (rectangle.xMin + rectangle.width * 0.5f) * cellWidth;
+            float centerZ = bounds.min.z + (rectangle.yMin + rectangle.height * 0.5f) * cellDepth;
+            Vector2 textArea = vertical
+                ? new Vector2(safeDepth, safeWidth)
+                : new Vector2(safeWidth, safeDepth);
+            return new PartitionLabelPlacement(
+                new Vector3(centerX, bounds.max.y + bounds.size.y * surfaceOffset, centerZ),
+                textArea,
+                vertical);
+        }
+
+        internal static RectInt FindLargestContainedRectangle(
+            HashSet<Vector2Int> cells,
+            int columns,
+            int rows)
+        {
+            int[] heights = new int[columns];
+            int[] stack = new int[columns + 1];
+            RectInt best = default;
+            int bestArea = 0;
+
+            for (int z = 0; z < rows; z++)
+            {
+                for (int x = 0; x < columns; x++)
+                    heights[x] = cells.Contains(new Vector2Int(x, z)) ? heights[x] + 1 : 0;
+
+                int stackCount = 0;
+                for (int x = 0; x <= columns; x++)
+                {
+                    int currentHeight = x < columns ? heights[x] : 0;
+                    while (stackCount > 0 && heights[stack[stackCount - 1]] > currentHeight)
+                    {
+                        int barIndex = stack[--stackCount];
+                        int height = heights[barIndex];
+                        int left = stackCount == 0 ? 0 : stack[stackCount - 1] + 1;
+                        int width = x - left;
+                        int area = width * height;
+                        if (area > bestArea || area == bestArea && IsBetterAspect(width, height, best))
+                        {
+                            bestArea = area;
+                            best = new RectInt(left, z - height + 1, width, height);
+                        }
+                    }
+
+                    if (x < columns)
+                        stack[stackCount++] = x;
+                }
+            }
+
+            if (bestArea == 0)
+            {
+                foreach (Vector2Int cell in cells)
+                    return new RectInt(cell.x, cell.y, 1, 1);
+            }
+            return best;
+        }
+
+        private static bool IsBetterAspect(int width, int height, RectInt current)
+        {
+            float candidateAspect = Mathf.Max(width, height) / (float)Mathf.Max(1, Mathf.Min(width, height));
+            float currentAspect = Mathf.Max(current.width, current.height) /
+                                  (float)Mathf.Max(1, Mathf.Min(current.width, current.height));
+            return candidateAspect < currentAspect;
+        }
+    }
+}
+
+namespace MeshGeneration.SurfacePartitioning
+{
+    internal static class PartitionMeshBuilder
+    {
+        private const float Epsilon = 0.00001f;
+
+        public static Mesh Build(
+            string meshName,
+            IReadOnlyCollection<Vector2Int> cells,
+            int columns,
+            int rows,
+            Bounds bounds,
+            float normalizedGap,
+            float normalizedCornerRadius,
+            int cornerSegments,
+            float normalizedBevel,
+            int bevelSegments)
+        {
+            return Build(meshName, cells, columns, rows, bounds, normalizedGap, normalizedCornerRadius,
+                cornerSegments, normalizedBevel, bevelSegments, SurfaceRoundingAxes.All);
+        }
+
+        public static Mesh Build(
+            string meshName,
+            IReadOnlyCollection<Vector2Int> cells,
+            int columns,
+            int rows,
+            Bounds bounds,
+            float normalizedGap,
+            float normalizedCornerRadius,
+            int cornerSegments,
+            float normalizedBevel,
+            int bevelSegments,
+            SurfaceRoundingAxes roundingAxes)
+        {
+            List<Vector2Int> gridContour = ExtractOuterContour(cells);
+            float cellWidth = bounds.size.x / columns;
+            float cellDepth = bounds.size.z / rows;
+            List<Vector2> contour = new List<Vector2>(gridContour.Count);
+            foreach (Vector2Int point in gridContour)
+            {
+                contour.Add(new Vector2(
+                    bounds.min.x + point.x * cellWidth,
+                    bounds.min.z + point.y * cellDepth));
+            }
+
+            return BuildFromContour(meshName, contour, bounds, normalizedGap, normalizedCornerRadius,
+                cornerSegments, normalizedBevel, bevelSegments, Mathf.Min(cellWidth, cellDepth), roundingAxes);
+        }
+
+        public static Mesh BuildFromContour(
+            string meshName,
+            IReadOnlyList<Vector2> sourceContour,
+            Bounds bounds,
+            float normalizedGap,
+            float normalizedCornerRadius,
+            int cornerSegments,
+            float normalizedBevel,
+            int bevelSegments)
+        {
+            return BuildFromContour(meshName, sourceContour, bounds, normalizedGap, normalizedCornerRadius,
+                cornerSegments, normalizedBevel, bevelSegments, 0f, SurfaceRoundingAxes.All);
+        }
+
+        public static Mesh BuildFromContour(
+            string meshName,
+            IReadOnlyList<Vector2> sourceContour,
+            Bounds bounds,
+            float normalizedGap,
+            float normalizedCornerRadius,
+            int cornerSegments,
+            float normalizedBevel,
+            int bevelSegments,
+            SurfaceRoundingAxes roundingAxes)
+        {
+            return BuildFromContour(meshName, sourceContour, bounds, normalizedGap, normalizedCornerRadius,
+                cornerSegments, normalizedBevel, bevelSegments, 0f, roundingAxes);
+        }
+
+        private static Mesh BuildFromContour(
+            string meshName,
+            IReadOnlyList<Vector2> sourceContour,
+            Bounds bounds,
+            float normalizedGap,
+            float normalizedCornerRadius,
+            int cornerSegments,
+            float normalizedBevel,
+            int bevelSegments,
+            float gridFeatureSize,
+            SurfaceRoundingAxes roundingAxes)
+        {
+            List<Vector2> contour = new List<Vector2>(sourceContour);
+
+            EnsureCounterClockwise(contour);
+            contour = RemoveCollinear(contour);
+
+            float shortestSide = Mathf.Min(bounds.size.x, bounds.size.z);
+            float minimumEdge = MinimumEdgeLength(contour);
+            float featureSize = gridFeatureSize > Epsilon ? gridFeatureSize : minimumEdge;
+            float maximumInset = featureSize * 0.22f;
+            float halfGap = Mathf.Min(normalizedGap * shortestSide * 0.5f, maximumInset);
+            List<Vector2> insetContour = OffsetPolygon(contour, halfGap);
+
+            bool roundVerticalEdges = (roundingAxes & SurfaceRoundingAxes.Y) != 0;
+            float radius = roundVerticalEdges
+                ? Mathf.Min(normalizedCornerRadius * shortestSide, featureSize * 0.35f)
+                : 0f;
+            List<Vector2> roundedContour = RoundCorners(insetContour, radius, cornerSegments);
+            roundedContour = RemoveCollinear(roundedContour);
+            EnsureCounterClockwise(roundedContour);
+
+            float halfHeight = bounds.size.y * 0.5f;
+            float bevel = Mathf.Min(normalizedBevel * shortestSide, bounds.size.y * 0.45f);
+            bevel = Mathf.Min(bevel, featureSize * 0.2f);
+            return Extrude(meshName, roundedContour, bounds.center.y, halfHeight, bevel, bevelSegments,
+                bounds, roundingAxes);
+        }
+
+        private static float MinimumEdgeLength(IReadOnlyList<Vector2> contour)
+        {
+            float minimum = float.MaxValue;
+            for (int i = 0; i < contour.Count; i++)
+                minimum = Mathf.Min(minimum, Vector2.Distance(contour[i], contour[(i + 1) % contour.Count]));
+            return minimum == float.MaxValue ? 0f : minimum;
+        }
+
+        private static List<Vector2Int> ExtractOuterContour(IReadOnlyCollection<Vector2Int> cells)
+        {
+            HashSet<DirectedEdge> edges = new HashSet<DirectedEdge>();
+            foreach (Vector2Int cell in cells)
+            {
+                Vector2Int a = new Vector2Int(cell.x, cell.y);
+                Vector2Int b = new Vector2Int(cell.x + 1, cell.y);
+                Vector2Int c = new Vector2Int(cell.x + 1, cell.y + 1);
+                Vector2Int d = new Vector2Int(cell.x, cell.y + 1);
+                AddOrCancel(edges, new DirectedEdge(a, b));
+                AddOrCancel(edges, new DirectedEdge(b, c));
+                AddOrCancel(edges, new DirectedEdge(c, d));
+                AddOrCancel(edges, new DirectedEdge(d, a));
+            }
+
+            Dictionary<Vector2Int, List<Vector2Int>> outgoing = new Dictionary<Vector2Int, List<Vector2Int>>();
+            foreach (DirectedEdge edge in edges)
+            {
+                if (!outgoing.TryGetValue(edge.From, out List<Vector2Int> targets))
+                {
+                    targets = new List<Vector2Int>();
+                    outgoing.Add(edge.From, targets);
+                }
+                targets.Add(edge.To);
+            }
+
+            HashSet<DirectedEdge> unused = new HashSet<DirectedEdge>(edges);
+            List<List<Vector2Int>> loops = new List<List<Vector2Int>>();
+            while (unused.Count > 0)
+            {
+                DirectedEdge first = default;
+                foreach (DirectedEdge edge in unused)
+                {
+                    first = edge;
+                    break;
+                }
+
+                List<Vector2Int> loop = new List<Vector2Int> { first.From };
+                Vector2Int current = first.From;
+                Vector2Int previous = first.From - (first.To - first.From);
+                int guard = unused.Count + 1;
+                while (guard-- > 0)
+                {
+                    Vector2Int next = ChooseNextEdge(previous, current, outgoing, unused);
+                    if (next == current)
+                        break;
+
+                    unused.Remove(new DirectedEdge(current, next));
+                    previous = current;
+                    current = next;
+                    if (current == loop[0])
+                        break;
+                    loop.Add(current);
+                }
+
+                if (loop.Count >= 3)
+                    loops.Add(loop);
+            }
+
+            if (loops.Count == 0)
+                throw new InvalidOperationException("A surface-partitioner region produced no valid boundary.");
+
+            List<Vector2Int> largest = loops[0];
+            float largestArea = Mathf.Abs(SignedArea(largest));
+            for (int i = 1; i < loops.Count; i++)
+            {
+                float area = Mathf.Abs(SignedArea(loops[i]));
+                if (area > largestArea)
+                {
+                    largest = loops[i];
+                    largestArea = area;
+                }
+            }
+            return largest;
+        }
+
+        private static Vector2Int ChooseNextEdge(
+            Vector2Int previous,
+            Vector2Int current,
+            IReadOnlyDictionary<Vector2Int, List<Vector2Int>> outgoing,
+            HashSet<DirectedEdge> unused)
+        {
+            if (!outgoing.TryGetValue(current, out List<Vector2Int> candidates))
+                return current;
+
+            Vector2Int incoming = current - previous;
+            Vector2Int best = current;
+            int bestPriority = int.MinValue;
+            foreach (Vector2Int candidate in candidates)
+            {
+                if (!unused.Contains(new DirectedEdge(current, candidate)))
+                    continue;
+                Vector2Int direction = candidate - current;
+                int cross = incoming.x * direction.y - incoming.y * direction.x;
+                int dot = incoming.x * direction.x + incoming.y * direction.y;
+                int priority = cross > 0 ? 3 : dot > 0 ? 2 : cross < 0 ? 1 : 0;
+                if (priority > bestPriority)
+                {
+                    bestPriority = priority;
+                    best = candidate;
+                }
+            }
+            return best;
+        }
+
+        private static void AddOrCancel(HashSet<DirectedEdge> edges, DirectedEdge edge)
+        {
+            DirectedEdge reverse = new DirectedEdge(edge.To, edge.From);
+            if (!edges.Remove(reverse))
+                edges.Add(edge);
+        }
+
+        private static List<Vector2> RemoveCollinear(IReadOnlyList<Vector2> polygon)
+        {
+            List<Vector2> result = new List<Vector2>(polygon.Count);
+            for (int i = 0; i < polygon.Count; i++)
+            {
+                Vector2 previous = polygon[(i - 1 + polygon.Count) % polygon.Count];
+                Vector2 current = polygon[i];
+                Vector2 next = polygon[(i + 1) % polygon.Count];
+                // The contour can be very small when a surface is split into hundreds of pieces.
+                // Cross products scale with area, so a linear-distance epsilon would erase valid corners.
+                if (Mathf.Abs(Cross(current - previous, next - current)) > Epsilon * Epsilon)
+                    result.Add(current);
+            }
+            return result;
+        }
+
+        private static List<Vector2> OffsetPolygon(IReadOnlyList<Vector2> polygon, float distance)
+        {
+            if (distance <= Epsilon)
+                return new List<Vector2>(polygon);
+
+            List<Vector2> result = new List<Vector2>(polygon.Count);
+            for (int i = 0; i < polygon.Count; i++)
+            {
+                Vector2 previous = polygon[(i - 1 + polygon.Count) % polygon.Count];
+                Vector2 current = polygon[i];
+                Vector2 next = polygon[(i + 1) % polygon.Count];
+                Vector2 incoming = (current - previous).normalized;
+                Vector2 outgoing = (next - current).normalized;
+                Vector2 incomingNormal = new Vector2(-incoming.y, incoming.x);
+                Vector2 outgoingNormal = new Vector2(-outgoing.y, outgoing.x);
+                Vector2 firstPoint = current + incomingNormal * distance;
+                Vector2 secondPoint = current + outgoingNormal * distance;
+
+                if (TryIntersectLines(firstPoint, incoming, secondPoint, outgoing, out Vector2 intersection))
+                    result.Add(intersection);
+                else
+                    result.Add(current + incomingNormal * distance);
+            }
+            return result;
+        }
+
+        private static List<Vector2> OffsetPolygon(
+            IReadOnlyList<Vector2> polygon,
+            float distance,
+            SurfaceRoundingAxes edgeAxes)
+        {
+            if (distance <= Epsilon)
+                return new List<Vector2>(polygon);
+
+            List<Vector2> result = new List<Vector2>(polygon.Count);
+            for (int i = 0; i < polygon.Count; i++)
+            {
+                Vector2 previous = polygon[(i - 1 + polygon.Count) % polygon.Count];
+                Vector2 current = polygon[i];
+                Vector2 next = polygon[(i + 1) % polygon.Count];
+                Vector2 incoming = (current - previous).normalized;
+                Vector2 outgoing = (next - current).normalized;
+                Vector2 incomingNormal = new Vector2(-incoming.y, incoming.x);
+                Vector2 outgoingNormal = new Vector2(-outgoing.y, outgoing.x);
+                float incomingDistance = IsEdgeAxisEnabled(incoming, edgeAxes) ? distance : 0f;
+                float outgoingDistance = IsEdgeAxisEnabled(outgoing, edgeAxes) ? distance : 0f;
+                Vector2 firstPoint = current + incomingNormal * incomingDistance;
+                Vector2 secondPoint = current + outgoingNormal * outgoingDistance;
+
+                if (TryIntersectLines(firstPoint, incoming, secondPoint, outgoing, out Vector2 intersection))
+                    result.Add(intersection);
+                else
+                    result.Add(firstPoint);
+            }
+            return result;
+        }
+
+        private static bool IsEdgeAxisEnabled(Vector2 direction, SurfaceRoundingAxes edgeAxes)
+        {
+            bool hasX = Mathf.Abs(direction.x) > Epsilon;
+            bool hasZ = Mathf.Abs(direction.y) > Epsilon;
+            bool xEnabled = !hasX || (edgeAxes & SurfaceRoundingAxes.X) != 0;
+            bool zEnabled = !hasZ || (edgeAxes & SurfaceRoundingAxes.Z) != 0;
+            return xEnabled && zEnabled;
+        }
+
+        private static bool TryIntersectLines(Vector2 firstPoint, Vector2 firstDirection, Vector2 secondPoint, Vector2 secondDirection, out Vector2 intersection)
+        {
+            float denominator = Cross(firstDirection, secondDirection);
+            if (Mathf.Abs(denominator) <= Epsilon)
+            {
+                intersection = default;
+                return false;
+            }
+
+            float t = Cross(secondPoint - firstPoint, secondDirection) / denominator;
+            intersection = firstPoint + firstDirection * t;
+            return true;
+        }
+
+        private static List<Vector2> RoundCorners(IReadOnlyList<Vector2> polygon, float requestedRadius, int segments)
+        {
+            if (requestedRadius <= Epsilon || segments <= 0)
+                return new List<Vector2>(polygon);
+
+            List<Vector2> result = new List<Vector2>(polygon.Count * (segments + 1));
+            for (int i = 0; i < polygon.Count; i++)
+            {
+                Vector2 previous = polygon[(i - 1 + polygon.Count) % polygon.Count];
+                Vector2 current = polygon[i];
+                Vector2 next = polygon[(i + 1) % polygon.Count];
+                Vector2 toPrevious = (previous - current).normalized;
+                Vector2 toNext = (next - current).normalized;
+                float radius = Mathf.Min(requestedRadius,
+                    Mathf.Min(Vector2.Distance(previous, current), Vector2.Distance(next, current)) * 0.45f);
+
+                Vector2 start = current + toPrevious * radius;
+                Vector2 end = current + toNext * radius;
+                Vector2 center = current + (toPrevious + toNext) * radius;
+                float startAngle = Mathf.Atan2(start.y - center.y, start.x - center.x);
+                float endAngle = Mathf.Atan2(end.y - center.y, end.x - center.x);
+                float turn = Cross(current - previous, next - current);
+                float delta = NormalizeAngle(endAngle - startAngle);
+                if (turn > 0f && delta < 0f) delta += Mathf.PI * 2f;
+                if (turn < 0f && delta > 0f) delta -= Mathf.PI * 2f;
+
+                for (int segment = 0; segment <= segments; segment++)
+                {
+                    float angle = startAngle + delta * segment / segments;
+                    result.Add(center + new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * radius);
+                }
+            }
+            return result;
+        }
+
+        private static Mesh Extrude(
+            string meshName,
+            IReadOnlyList<Vector2> footprint,
+            float centerY,
+            float halfHeight,
+            float bevel,
+            int bevelSegments,
+            Bounds sourceBounds,
+            SurfaceRoundingAxes roundingAxes)
+        {
+            List<List<Vector2>> ringContours = new List<List<Vector2>>();
+            List<float> ringHeights = new List<float>();
+            float bottom = centerY - halfHeight;
+            float top = centerY + halfHeight;
+
+            SurfaceRoundingAxes horizontalEdgeAxes = roundingAxes & (SurfaceRoundingAxes.X | SurfaceRoundingAxes.Z);
+            if (bevel <= Epsilon || horizontalEdgeAxes == SurfaceRoundingAxes.None)
+            {
+                ringContours.Add(new List<Vector2>(footprint));
+                ringHeights.Add(bottom);
+                ringContours.Add(new List<Vector2>(footprint));
+                ringHeights.Add(top);
+            }
+            else
+            {
+                for (int i = 0; i <= bevelSegments; i++)
+                {
+                    float angle = Mathf.PI * 0.5f * i / bevelSegments;
+                    float inset = bevel * (1f - Mathf.Sin(angle));
+                    float y = bottom + bevel * (1f - Mathf.Cos(angle));
+                    ringContours.Add(OffsetPolygon(footprint, inset, horizontalEdgeAxes));
+                    ringHeights.Add(y);
+                }
+
+                ringContours.Add(new List<Vector2>(footprint));
+                ringHeights.Add(top - bevel);
+
+                for (int i = 1; i <= bevelSegments; i++)
+                {
+                    float angle = Mathf.PI * 0.5f * i / bevelSegments;
+                    float inset = bevel * (1f - Mathf.Cos(angle));
+                    float y = top - bevel + bevel * Mathf.Sin(angle);
+                    ringContours.Add(OffsetPolygon(footprint, inset, horizontalEdgeAxes));
+                    ringHeights.Add(y);
+                }
+            }
+
+            int pointsPerRing = footprint.Count;
+            List<Vector3> vertices = new List<Vector3>(pointsPerRing * (ringContours.Count + 2));
+            List<Vector2> uvs = new List<Vector2>(vertices.Capacity);
+            for (int ring = 0; ring < ringContours.Count; ring++)
+            {
+                for (int i = 0; i < pointsPerRing; i++)
+                {
+                    Vector2 point = ringContours[ring][i];
+                    vertices.Add(new Vector3(point.x, ringHeights[ring], point.y));
+                    uvs.Add(ToUv(point, sourceBounds));
+                }
+            }
+
+            List<int> triangles = new List<int>();
+            for (int ring = 0; ring < ringContours.Count - 1; ring++)
+            {
+                int lower = ring * pointsPerRing;
+                int upper = (ring + 1) * pointsPerRing;
+                for (int i = 0; i < pointsPerRing; i++)
+                {
+                    int next = (i + 1) % pointsPerRing;
+                    triangles.Add(lower + i);
+                    triangles.Add(upper + next);
+                    triangles.Add(lower + next);
+                    triangles.Add(lower + i);
+                    triangles.Add(upper + i);
+                    triangles.Add(upper + next);
+                }
+            }
+
+            List<int> capTriangles = Triangulate(ringContours[ringContours.Count - 1]);
+            int topStart = vertices.Count;
+            List<Vector2> topContour = ringContours[ringContours.Count - 1];
+            for (int i = 0; i < pointsPerRing; i++)
+            {
+                vertices.Add(new Vector3(topContour[i].x, top, topContour[i].y));
+                uvs.Add(ToUv(topContour[i], sourceBounds));
+            }
+            for (int i = 0; i < capTriangles.Count; i += 3)
+            {
+                triangles.Add(topStart + capTriangles[i]);
+                triangles.Add(topStart + capTriangles[i + 2]);
+                triangles.Add(topStart + capTriangles[i + 1]);
+            }
+
+            int bottomStart = vertices.Count;
+            List<Vector2> bottomContour = ringContours[0];
+            for (int i = 0; i < pointsPerRing; i++)
+            {
+                vertices.Add(new Vector3(bottomContour[i].x, bottom, bottomContour[i].y));
+                uvs.Add(ToUv(bottomContour[i], sourceBounds));
+            }
+            List<int> bottomTriangles = Triangulate(bottomContour);
+            for (int i = 0; i < bottomTriangles.Count; i += 3)
+            {
+                triangles.Add(bottomStart + bottomTriangles[i]);
+                triangles.Add(bottomStart + bottomTriangles[i + 1]);
+                triangles.Add(bottomStart + bottomTriangles[i + 2]);
+            }
+
+            Mesh mesh = new Mesh { name = meshName };
+            if (vertices.Count > ushort.MaxValue)
+                mesh.indexFormat = IndexFormat.UInt32;
+            mesh.SetVertices(vertices);
+            mesh.SetUVs(0, uvs);
+            mesh.SetTriangles(triangles, 0);
+            mesh.RecalculateNormals();
+            mesh.RecalculateTangents();
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
+        private static List<int> Triangulate(IReadOnlyList<Vector2> polygon)
+        {
+            List<int> remaining = new List<int>(polygon.Count);
+            for (int i = 0; i < polygon.Count; i++)
+                remaining.Add(i);
+
+            List<int> triangles = new List<int>((polygon.Count - 2) * 3);
+            int guard = polygon.Count * polygon.Count;
+            while (remaining.Count > 3 && guard-- > 0)
+            {
+                bool foundEar = false;
+                for (int i = 0; i < remaining.Count; i++)
+                {
+                    int previous = remaining[(i - 1 + remaining.Count) % remaining.Count];
+                    int current = remaining[i];
+                    int next = remaining[(i + 1) % remaining.Count];
+                    if (Cross(polygon[current] - polygon[previous], polygon[next] - polygon[current]) <= 0f)
+                        continue;
+
+                    bool containsPoint = false;
+                    for (int p = 0; p < remaining.Count; p++)
+                    {
+                        int candidate = remaining[p];
+                        if (candidate == previous || candidate == current || candidate == next)
+                            continue;
+                        if (PointInTriangle(polygon[candidate], polygon[previous], polygon[current], polygon[next]))
+                        {
+                            containsPoint = true;
+                            break;
+                        }
+                    }
+                    if (containsPoint)
+                        continue;
+
+                    triangles.Add(previous);
+                    triangles.Add(current);
+                    triangles.Add(next);
+                    remaining.RemoveAt(i);
+                    foundEar = true;
+                    break;
+                }
+
+                if (!foundEar)
+                    throw new InvalidOperationException(
+                        $"Surface partitioner could not triangulate a generated contour " +
+                        $"(points={polygon.Count}, signedArea={SignedArea(polygon):0.######}).");
+            }
+
+            if (remaining.Count == 3)
+            {
+                triangles.Add(remaining[0]);
+                triangles.Add(remaining[1]);
+                triangles.Add(remaining[2]);
+            }
+            return triangles;
+        }
+
+        private static bool PointInTriangle(Vector2 point, Vector2 a, Vector2 b, Vector2 c)
+        {
+            float first = Cross(b - a, point - a);
+            float second = Cross(c - b, point - b);
+            float third = Cross(a - c, point - c);
+            // Points on an ear edge do not invalidate the ear. Treating them as inside
+            // prevents triangulation of rounded orthogonal contours with many collinear tangencies.
+            return first > 0f && second > 0f && third > 0f;
+        }
+
+        private static Vector2 ToUv(Vector2 point, Bounds bounds)
+        {
+            return new Vector2(
+                Mathf.InverseLerp(bounds.min.x, bounds.max.x, point.x),
+                Mathf.InverseLerp(bounds.min.z, bounds.max.z, point.y));
+        }
+
+        private static void EnsureCounterClockwise(List<Vector2> polygon)
+        {
+            if (SignedArea(polygon) < 0f)
+                polygon.Reverse();
+        }
+
+        private static float SignedArea(IReadOnlyList<Vector2> polygon)
+        {
+            float area = 0f;
+            for (int i = 0; i < polygon.Count; i++)
+            {
+                Vector2 current = polygon[i];
+                Vector2 next = polygon[(i + 1) % polygon.Count];
+                area += current.x * next.y - next.x * current.y;
+            }
+            return area * 0.5f;
+        }
+
+        private static float SignedArea(IReadOnlyList<Vector2Int> polygon)
+        {
+            float area = 0f;
+            for (int i = 0; i < polygon.Count; i++)
+            {
+                Vector2Int current = polygon[i];
+                Vector2Int next = polygon[(i + 1) % polygon.Count];
+                area += current.x * next.y - next.x * current.y;
+            }
+            return area * 0.5f;
+        }
+
+        private static float Cross(Vector2 first, Vector2 second)
+        {
+            return first.x * second.y - first.y * second.x;
+        }
+
+        private static float NormalizeAngle(float angle)
+        {
+            while (angle > Mathf.PI) angle -= Mathf.PI * 2f;
+            while (angle < -Mathf.PI) angle += Mathf.PI * 2f;
+            return angle;
+        }
+
+        private readonly struct DirectedEdge : IEquatable<DirectedEdge>
+        {
+            public readonly Vector2Int From;
+            public readonly Vector2Int To;
+
+            public DirectedEdge(Vector2Int from, Vector2Int to)
+            {
+                From = from;
+                To = to;
+            }
+
+            public bool Equals(DirectedEdge other) => From == other.From && To == other.To;
+            public override bool Equals(object obj) => obj is DirectedEdge other && Equals(other);
+            public override int GetHashCode() => (From.GetHashCode() * 397) ^ To.GetHashCode();
+        }
+    }
+}
+
+namespace MeshGeneration.SurfacePartitioning
+{
+    internal static class SourceFootprintExtractor
+    {
+        public static List<Vector2> Extract(Mesh mesh, Vector3 scale)
+        {
+            Vector3[] vertices = mesh.vertices;
+            int[] triangles = mesh.triangles;
+            Bounds bounds = mesh.bounds;
+            float tolerance = Mathf.Max(0.00001f, Mathf.Max(bounds.size.x, bounds.size.z) * 0.00001f);
+            float topTolerance = Mathf.Max(0.00001f, bounds.size.y * 0.0001f);
+            Dictionary<UndirectedEdge, int> edgeCounts = new Dictionary<UndirectedEdge, int>();
+
+            for (int index = 0; index < triangles.Length; index += 3)
+            {
+                Vector3 a = vertices[triangles[index]];
+                Vector3 b = vertices[triangles[index + 1]];
+                Vector3 c = vertices[triangles[index + 2]];
+                if (Mathf.Abs(a.y - bounds.max.y) > topTolerance ||
+                    Mathf.Abs(b.y - bounds.max.y) > topTolerance ||
+                    Mathf.Abs(c.y - bounds.max.y) > topTolerance)
+                    continue;
+
+                PointKey ka = PointKey.From(a, tolerance);
+                PointKey kb = PointKey.From(b, tolerance);
+                PointKey kc = PointKey.From(c, tolerance);
+                AddEdge(edgeCounts, new UndirectedEdge(ka, kb));
+                AddEdge(edgeCounts, new UndirectedEdge(kb, kc));
+                AddEdge(edgeCounts, new UndirectedEdge(kc, ka));
+            }
+
+            Dictionary<PointKey, List<PointKey>> adjacency = new Dictionary<PointKey, List<PointKey>>();
+            HashSet<UndirectedEdge> unused = new HashSet<UndirectedEdge>();
+            foreach (KeyValuePair<UndirectedEdge, int> pair in edgeCounts)
+            {
+                if (pair.Value != 1)
+                    continue;
+                unused.Add(pair.Key);
+                AddNeighbour(adjacency, pair.Key.A, pair.Key.B);
+                AddNeighbour(adjacency, pair.Key.B, pair.Key.A);
+            }
+
+            if (unused.Count == 0)
+                throw new InvalidOperationException(
+                    $"Mesh '{mesh.name}' has no readable flat top boundary. " +
+                    "The source must be a closed XZ slab with its top vertices on one Y plane.");
+
+            List<List<PointKey>> loops = new List<List<PointKey>>();
+            while (unused.Count > 0)
+            {
+                UndirectedEdge first = default;
+                foreach (UndirectedEdge edge in unused)
+                {
+                    first = edge;
+                    break;
+                }
+
+                List<PointKey> loop = new List<PointKey> { first.A };
+                PointKey previous = first.A;
+                PointKey current = first.B;
+                unused.Remove(first);
+                int guard = edgeCounts.Count + 1;
+                while (guard-- > 0 && current != loop[0])
+                {
+                    loop.Add(current);
+                    if (!adjacency.TryGetValue(current, out List<PointKey> neighbours))
+                        break;
+
+                    PointKey next = default;
+                    bool found = false;
+                    foreach (PointKey neighbour in neighbours)
+                    {
+                        UndirectedEdge edge = new UndirectedEdge(current, neighbour);
+                        if (neighbour != previous && unused.Contains(edge))
+                        {
+                            next = neighbour;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found)
+                        break;
+                    unused.Remove(new UndirectedEdge(current, next));
+                    previous = current;
+                    current = next;
+                }
+
+                if (current == loop[0] && loop.Count >= 3)
+                    loops.Add(loop);
+            }
+
+            if (loops.Count == 0)
+                throw new InvalidOperationException($"Mesh '{mesh.name}' has an open or ambiguous top boundary.");
+
+            List<Vector2> largest = null;
+            float largestArea = 0f;
+            foreach (List<PointKey> loop in loops)
+            {
+                List<Vector2> contour = new List<Vector2>(loop.Count);
+                foreach (PointKey point in loop)
+                    contour.Add(new Vector2(point.X * tolerance * scale.x, point.Z * tolerance * scale.z));
+                contour = RemoveCollinear(contour);
+                float area = Mathf.Abs(SignedArea(contour));
+                if (area > largestArea)
+                {
+                    largestArea = area;
+                    largest = contour;
+                }
+            }
+
+            if (largest == null || largest.Count < 3)
+                throw new InvalidOperationException($"Mesh '{mesh.name}' produced no usable XZ footprint.");
+            if (SignedArea(largest) < 0f)
+                largest.Reverse();
+            return largest;
+        }
+
+        public static bool IsAxisAlignedRectangle(IReadOnlyList<Vector2> contour)
+        {
+            if (contour.Count != 4)
+                return false;
+            for (int i = 0; i < contour.Count; i++)
+            {
+                Vector2 edge = contour[(i + 1) % contour.Count] - contour[i];
+                if (Mathf.Abs(edge.x) > 0.0001f && Mathf.Abs(edge.y) > 0.0001f)
+                    return false;
+            }
+            return true;
+        }
+
+        internal static float SignedArea(IReadOnlyList<Vector2> contour)
+        {
+            float area = 0f;
+            for (int i = 0; i < contour.Count; i++)
+            {
+                Vector2 current = contour[i];
+                Vector2 next = contour[(i + 1) % contour.Count];
+                area += current.x * next.y - next.x * current.y;
+            }
+            return area * 0.5f;
+        }
+
+        internal static bool ContainsPoint(IReadOnlyList<Vector2> contour, Vector2 point)
+        {
+            bool inside = false;
+            for (int i = 0, previous = contour.Count - 1; i < contour.Count; previous = i++)
+            {
+                Vector2 a = contour[i];
+                Vector2 b = contour[previous];
+                if ((a.y > point.y) != (b.y > point.y) &&
+                    point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x)
+                    inside = !inside;
+            }
+            return inside;
+        }
+
+        private static List<Vector2> RemoveCollinear(IReadOnlyList<Vector2> contour)
+        {
+            List<Vector2> result = new List<Vector2>(contour.Count);
+            for (int i = 0; i < contour.Count; i++)
+            {
+                Vector2 previous = contour[(i - 1 + contour.Count) % contour.Count];
+                Vector2 current = contour[i];
+                Vector2 next = contour[(i + 1) % contour.Count];
+                float cross = Cross(current - previous, next - current);
+                if (Mathf.Abs(cross) > 0.0000001f)
+                    result.Add(current);
+            }
+            return result;
+        }
+
+        private static float Cross(Vector2 first, Vector2 second)
+        {
+            return first.x * second.y - first.y * second.x;
+        }
+
+        private static void AddEdge(IDictionary<UndirectedEdge, int> counts, UndirectedEdge edge)
+        {
+            counts.TryGetValue(edge, out int count);
+            counts[edge] = count + 1;
+        }
+
+        private static void AddNeighbour(IDictionary<PointKey, List<PointKey>> adjacency,
+            PointKey point, PointKey neighbour)
+        {
+            if (!adjacency.TryGetValue(point, out List<PointKey> neighbours))
+            {
+                neighbours = new List<PointKey>(2);
+                adjacency.Add(point, neighbours);
+            }
+            if (!neighbours.Contains(neighbour))
+                neighbours.Add(neighbour);
+        }
+
+        private readonly struct PointKey : IEquatable<PointKey>, IComparable<PointKey>
+        {
+            public readonly long X;
+            public readonly long Z;
+
+            public PointKey(long x, long z)
+            {
+                X = x;
+                Z = z;
+            }
+
+            public static PointKey From(Vector3 point, float tolerance)
+            {
+                return new PointKey(
+                    (long)Math.Round(point.x / tolerance),
+                    (long)Math.Round(point.z / tolerance));
+            }
+
+            public int CompareTo(PointKey other)
+            {
+                int x = X.CompareTo(other.X);
+                return x != 0 ? x : Z.CompareTo(other.Z);
+            }
+
+            public bool Equals(PointKey other) => X == other.X && Z == other.Z;
+            public override bool Equals(object obj) => obj is PointKey other && Equals(other);
+            public override int GetHashCode() => (X.GetHashCode() * 397) ^ Z.GetHashCode();
+            public static bool operator ==(PointKey left, PointKey right) => left.Equals(right);
+            public static bool operator !=(PointKey left, PointKey right) => !left.Equals(right);
+        }
+
+        private readonly struct UndirectedEdge : IEquatable<UndirectedEdge>
+        {
+            public readonly PointKey A;
+            public readonly PointKey B;
+
+            public UndirectedEdge(PointKey first, PointKey second)
+            {
+                if (first.CompareTo(second) <= 0)
+                {
+                    A = first;
+                    B = second;
+                }
+                else
+                {
+                    A = second;
+                    B = first;
+                }
+            }
+
+            public bool Equals(UndirectedEdge other) => A.Equals(other.A) && B.Equals(other.B);
+            public override bool Equals(object obj) => obj is UndirectedEdge other && Equals(other);
+            public override int GetHashCode() => (A.GetHashCode() * 397) ^ B.GetHashCode();
+        }
+    }
+}
+
+namespace MeshGeneration.SurfacePartitioning
+{
+    [Flags]
+    public enum SurfaceRoundingAxes
+    {
+        None = 0,
+        X = 1 << 0,
+        Y = 1 << 1,
+        Z = 1 << 2,
+        All = X | Y | Z
+    }
+
+    [CreateAssetMenu(fileName = "SurfacePartitionDefinition", menuName = "Mesh Generation/Surface Partitioner Definition")]
+    public sealed class SurfacePartitionDefinition : ScriptableObject
+    {
+        internal const float DefaultMinAreaRatio = 0.65f;
+        internal const float DefaultMaxAreaRatio = 1.35f;
+        internal const float DefaultMinLegRatio = 0.3f;
+
+        [Header("Partition")]
+        [SerializeField, Min(1)] private int _pieceCount = 18;
+        [SerializeField, Range(0f, 1f)] private float _complexPieceRatio = 0.55f;
+        [SerializeField, Range(2, 2)] private int _maxRectanglesPerPiece = 2;
+        [SerializeField, Range(1.25f, 4f)] private float _maxComplexLegAspect = 2.25f;
+        [SerializeField, Range(1.25f, 4f)] private float _maxPieceAspect = 2.5f;
+        [SerializeField, Range(6, 24)] private int _targetCellsPerRectangle = 16;
+        [SerializeField] private int _seed = 13731;
+
+        [Header("Piece quality (relative to average piece area)")]
+        [SerializeField, Range(0.1f, 1f)] private float _minPieceAreaRatio = DefaultMinAreaRatio;
+        [SerializeField, Range(1f, 3f)] private float _maxPieceAreaRatio = DefaultMaxAreaRatio;
+        [SerializeField, Range(0.1f, 0.5f), Tooltip("Minimum L arm thickness / square root of its area.")]
+        private float _minLegThicknessRatio = DefaultMinLegRatio;
+
+        [Header("Shape (relative to the shortest XZ side)")]
+        [SerializeField, Range(0f, 0.1f)] private float _gap = 0.018f;
+        [SerializeField, Tooltip("Y rounds vertical edges. X and Z bevel top/bottom edges parallel to that axis.")]
+        private SurfaceRoundingAxes _roundingAxes = SurfaceRoundingAxes.All;
+        [SerializeField, Range(0f, 0.15f)] private float _cornerRadius = 0.035f;
+        [SerializeField, Range(1, 8)] private int _cornerSegments = 4;
+        [SerializeField, Range(0f, 0.1f)] private float _edgeBevel = 0.02f;
+        [SerializeField, Range(1, 6)] private int _bevelSegments = 3;
+
+        [Header("Labels")]
+        [SerializeField] private bool _generateLabels = true;
+        [SerializeField] private string _labelText = "П2601";
+        [SerializeField] private TMP_FontAsset _labelFont;
+        [SerializeField] private Color _labelColor = Color.white;
+        [SerializeField, Range(0.02f, 0.3f)] private float _labelPadding = 0.1f;
+        [SerializeField, Range(0.0001f, 0.02f)] private float _labelSurfaceOffset = 0.003f;
+
+        [Header("Output")]
+        [SerializeField] private bool _generateMeshColliders;
+        [SerializeField] private bool _castShadows = true;
+        [SerializeField] private bool _receiveShadows = true;
+
+        public float MinPieceAreaRatio => _minPieceAreaRatio;
+        public float MaxPieceAreaRatio => _maxPieceAreaRatio;
+        public float MinLegThicknessRatio => _minLegThicknessRatio;
+        public int PieceCount => _pieceCount;
+        public float ComplexPieceRatio => _complexPieceRatio;
+        public int MaxRectanglesPerPiece => _maxRectanglesPerPiece;
+        public float MaxComplexLegAspect => _maxComplexLegAspect;
+        public float MaxPieceAspect => _maxPieceAspect;
+        public int TargetCellsPerRectangle => _targetCellsPerRectangle;
+        public int Seed => _seed;
+        public float Gap => _gap;
+        public SurfaceRoundingAxes RoundingAxes => _roundingAxes;
+        public float CornerRadius => _cornerRadius;
+        public int CornerSegments => _cornerSegments;
+        public float EdgeBevel => _edgeBevel;
+        public int BevelSegments => _bevelSegments;
+        public bool GenerateLabels => _generateLabels;
+        public string LabelText => _labelText;
+        public TMP_FontAsset LabelFont => _labelFont;
+        public Color LabelColor => _labelColor;
+        public float LabelPadding => _labelPadding;
+        public float LabelSurfaceOffset => _labelSurfaceOffset;
+        public bool GenerateMeshColliders => _generateMeshColliders;
+        public bool CastShadows => _castShadows;
+        public bool ReceiveShadows => _receiveShadows;
+
+        private void OnValidate()
+        {
+            _minPieceAreaRatio = Mathf.Clamp(_minPieceAreaRatio, 0.1f, 1f);
+            _maxPieceAreaRatio = Mathf.Clamp(_maxPieceAreaRatio, 1f, 3f);
+            _minLegThicknessRatio = Mathf.Clamp(_minLegThicknessRatio, 0.1f, 0.5f);
+            _pieceCount = Mathf.Max(1, _pieceCount);
+            _maxRectanglesPerPiece = 2;
+            _maxComplexLegAspect = Mathf.Clamp(_maxComplexLegAspect, 1.25f, 4f);
+            _maxPieceAspect = Mathf.Clamp(_maxPieceAspect, 1.25f, 4f);
+            _targetCellsPerRectangle = Mathf.Clamp(_targetCellsPerRectangle, 6, 24);
+            _labelText = string.IsNullOrWhiteSpace(_labelText) ? "П2601" : _labelText;
+            _cornerSegments = Mathf.Clamp(_cornerSegments, 1, 8);
+            _bevelSegments = Mathf.Clamp(_bevelSegments, 1, 6);
+        }
+    }
+}
+
+namespace MeshGeneration.SurfacePartitioning
+{
+    [ExecuteAlways]
+    [DisallowMultipleComponent]
+    [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
+    public sealed class SurfacePartitioner : MonoBehaviour
+    {
+        private const string GeneratedRootName = "Surface Partitions (Generated)";
+
+        [SerializeField] private SurfacePartitionDefinition _definition;
+        [SerializeField] private MeshFilter _sourceMeshFilter;
+        [SerializeField] private MeshRenderer _sourceMeshRenderer;
+        [SerializeField] private Material _materialOverride;
+        [SerializeField, HideInInspector] private Transform _generatedRoot;
+
+        public SurfacePartitionDefinition Definition => _definition;
+        public int GeneratedPieceCount => _generatedRoot == null ? 0 : _generatedRoot.childCount;
+
+        public string LastPartitionError { get; private set; }
+
+        [ContextMenu("Partition")]
+        public void Partition()
+        {
+            if (!TryPartition(out string error))
+                Debug.LogWarning(error, this);
+        }
+
+        // Staging owns every newly built mesh until commit. Failed attempts leave the visible
+        // generation, source renderer and source collider exactly as they were.
+        public bool TryPartition(out string error)
+        {
+            Transform staging = null;
+            error = null;
+            try
+            {
+                ResolveReferences();
+                ValidateInput();
+                Mesh sourceMesh = _sourceMeshFilter.sharedMesh;
+                Vector3 scale = Abs(transform.lossyScale);
+                Bounds bounds = ScaleBounds(sourceMesh.bounds, scale);
+                List<Vector2> footprint = SourceFootprintExtractor.Extract(sourceMesh, scale);
+                SurfacePartition partition;
+                bool built = SourceFootprintExtractor.IsAxisAlignedRectangle(footprint)
+                    ? SurfacePartitionGenerator.TryGenerate(bounds.size.x / bounds.size.z,
+                        _definition.PieceCount, _definition.ComplexPieceRatio, _definition.MaxRectanglesPerPiece,
+                        _definition.MaxComplexLegAspect, _definition.MaxPieceAspect,
+                        _definition.TargetCellsPerRectangle, _definition.Seed,
+                        _definition.MinPieceAreaRatio, _definition.MaxPieceAreaRatio,
+                        _definition.MinLegThicknessRatio, out partition)
+                    : MaskedSurfacePartitionGenerator.TryGenerate(footprint, bounds,
+                        _definition.PieceCount, _definition.ComplexPieceRatio, _definition.MaxRectanglesPerPiece,
+                        _definition.MaxComplexLegAspect, _definition.MaxPieceAspect,
+                        _definition.TargetCellsPerRectangle, _definition.Seed,
+                        _definition.MinPieceAreaRatio, _definition.MaxPieceAreaRatio,
+                        _definition.MinLegThicknessRatio, out partition);
+                if (!built)
+                {
+                    error = $"Surface partitioner on '{name}' could not satisfy the shape and area limits " +
+                        $"for {_definition.PieceCount} pieces (seed {_definition.Seed}). Previous output was preserved.";
+                    LastPartitionError = error;
+                    return false;
+                }
+                var root = new GameObject(GeneratedRootName + " (Staging)");
+                root.SetActive(false);
+                staging = root.transform;
+                staging.SetParent(transform, false);
+                staging.localScale = Reciprocal(scale);
+                Material material = _materialOverride != null ? _materialOverride : _sourceMeshRenderer.sharedMaterial;
+                for (int i = 0; i < partition.Regions.Count; i++)
+                    CreatePiece(i, partition.Regions[i], partition.Columns, partition.Rows, bounds, material, staging);
+
+                ClearGeneratedInternal(false);
+                _generatedRoot = staging;
+                staging = null;
+                _generatedRoot.name = GeneratedRootName;
+                _generatedRoot.gameObject.SetActive(true);
+                _sourceMeshRenderer.enabled = false;
+                Collider sourceCollider = GetComponent<Collider>();
+                if (sourceCollider != null) sourceCollider.enabled = false;
+                LastPartitionError = null;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                DestroyRoot(staging);
+                error = $"Surface partitioner on '{name}': {exception.Message}";
+                LastPartitionError = error;
+                return false;
+            }
+        }
+
+        [ContextMenu("Clear Partitions")]
+        public void ClearPartitions()
+        {
+            ClearGeneratedInternal(true);
+        }
+
+        private void Reset()
+        {
+            ResolveReferences();
+        }
+
+        private void OnEnable()
+        {
+            ResolveReferences();
+            if (_generatedRoot == null)
+                _generatedRoot = transform.Find(GeneratedRootName);
+        }
+
+        private void ResolveReferences()
+        {
+            if (_sourceMeshFilter == null)
+                _sourceMeshFilter = GetComponent<MeshFilter>();
+            if (_sourceMeshRenderer == null)
+                _sourceMeshRenderer = GetComponent<MeshRenderer>();
+        }
+
+        private void ValidateInput()
+        {
+            if (_definition == null)
+                throw new InvalidOperationException($"{nameof(SurfacePartitioner)} on '{name}' requires a definition.");
+            if (_sourceMeshFilter == null || _sourceMeshFilter.sharedMesh == null)
+                throw new InvalidOperationException($"{nameof(SurfacePartitioner)} on '{name}' requires a source MeshFilter with a mesh.");
+            if (_sourceMeshRenderer == null)
+                throw new InvalidOperationException($"{nameof(SurfacePartitioner)} on '{name}' requires a source MeshRenderer.");
+
+            Bounds bounds = _sourceMeshFilter.sharedMesh.bounds;
+            if (bounds.size.x <= Mathf.Epsilon || bounds.size.y <= Mathf.Epsilon || bounds.size.z <= Mathf.Epsilon)
+                throw new InvalidOperationException($"Source mesh '{_sourceMeshFilter.sharedMesh.name}' on '{name}' must have volume on X, Y and Z axes.");
+        }
+
+        private void CreatePiece(
+            int index,
+            SurfacePartitionRegion region,
+            int columns,
+            int rows,
+            Bounds bounds,
+            Material material,
+            Transform parent)
+        {
+            Mesh mesh = PartitionMeshBuilder.Build(
+                $"Surface Partition {index + 1:00}",
+                region.Cells,
+                columns,
+                rows,
+                bounds,
+                _definition.Gap,
+                _definition.CornerRadius,
+                _definition.CornerSegments,
+                _definition.EdgeBevel,
+                _definition.BevelSegments,
+                _definition.RoundingAxes);
+
+            GameObject piece = new GameObject($"Partition {index + 1:00}");
+            piece.transform.SetParent(parent, false);
+
+            MeshFilter filter = piece.AddComponent<MeshFilter>();
+            filter.sharedMesh = mesh;
+
+            MeshRenderer renderer = piece.AddComponent<MeshRenderer>();
+            renderer.sharedMaterial = material;
+            renderer.shadowCastingMode = _definition.CastShadows ? ShadowCastingMode.On : ShadowCastingMode.Off;
+            renderer.receiveShadows = _definition.ReceiveShadows;
+
+            if (_definition.GenerateMeshColliders)
+            {
+                MeshCollider collider = piece.AddComponent<MeshCollider>();
+                collider.sharedMesh = mesh;
+            }
+
+            if (_definition.GenerateLabels)
+                CreateLabel(piece, region, columns, rows, bounds);
+        }
+
+        private void CreateLabel(
+            GameObject piece,
+            SurfacePartitionRegion region,
+            int columns,
+            int rows,
+            Bounds bounds)
+        {
+            TMP_FontAsset font = _definition.LabelFont;
+            if (font == null)
+                throw new InvalidOperationException(
+                    $"{nameof(SurfacePartitionDefinition)} '{_definition.name}' requires a TMP font when labels are enabled.");
+
+            PartitionLabelPlacement placement = PartitionLabelPlacementCalculator.Calculate(
+                region.Cells,
+                columns,
+                rows,
+                bounds,
+                _definition.Gap,
+                _definition.EdgeBevel,
+                _definition.LabelPadding,
+                _definition.LabelSurfaceOffset);
+
+            GameObject labelObject = new GameObject("Label");
+            // TMP must run Awake before entering the inactive staging hierarchy: its default
+            // settings otherwise overwrite our font-size limits when staging is committed.
+            TextMeshPro label = labelObject.AddComponent<TextMeshPro>();
+            labelObject.transform.SetParent(piece.transform, false);
+            labelObject.transform.localPosition = placement.Position;
+            Quaternion lieFlat = Quaternion.Euler(90f, 0f, 0f);
+            Quaternion verticalTurn = placement.IsVertical
+                ? Quaternion.Euler(0f, 0f, 90f)
+                : Quaternion.identity;
+            labelObject.transform.localRotation = lieFlat * verticalTurn;
+
+            label.font = font;
+            label.text = _definition.LabelText;
+            label.color = _definition.LabelColor;
+            label.alignment = TextAlignmentOptions.Center;
+            label.enableAutoSizing = true;
+            label.fontSizeMin = 0.01f;
+            label.fontSizeMax = 10f;
+            label.textWrappingMode = TextWrappingModes.NoWrap;
+            label.overflowMode = TextOverflowModes.Truncate;
+            label.margin = Vector4.zero;
+            label.rectTransform.sizeDelta = placement.TextArea;
+            label.rectTransform.pivot = new Vector2(0.5f, 0.5f);
+            label.ForceMeshUpdate(ignoreActiveState: true, forceTextReparsing: true);
+        }
+
+        private void ClearGeneratedInternal(bool restoreSource)
+        {
+            if (_generatedRoot == null)
+                _generatedRoot = transform.Find(GeneratedRootName);
+
+            DestroyRoot(_generatedRoot);
+            _generatedRoot = null;
+
+            if (!restoreSource)
+                return;
+
+            ResolveReferences();
+            if (_sourceMeshRenderer != null)
+                _sourceMeshRenderer.enabled = true;
+            Collider sourceCollider = GetComponent<Collider>();
+            if (sourceCollider != null)
+                sourceCollider.enabled = true;
+        }
+
+        private static void DestroyRoot(Transform root)
+        {
+            if (root == null) return;
+            root.gameObject.SetActive(false);
+            for (int i = root.childCount - 1; i >= 0; i--)
+            {
+                MeshFilter filter = root.GetChild(i).GetComponent<MeshFilter>();
+                if (filter != null && filter.sharedMesh != null) DestroyGeneratedObject(filter.sharedMesh);
+            }
+            // Deferred destruction in Play mode must not leave a second discoverable root.
+            root.name = GeneratedRootName + " (Retired)";
+            DestroyGeneratedObject(root.gameObject);
+        }
+
+        private static void DestroyGeneratedObject(UnityEngine.Object target)
+        {
+            if (target == null)
+                return;
+
+            if (Application.isPlaying)
+                Destroy(target);
+            else
+                DestroyImmediate(target);
+        }
+
+        internal static Bounds ScaleBounds(Bounds sourceBounds, Vector3 scale)
+        {
+            return new Bounds(
+                Vector3.Scale(sourceBounds.center, scale),
+                Vector3.Scale(sourceBounds.size, scale));
+        }
+
+        internal static Vector3 Reciprocal(Vector3 scale)
+        {
+            return new Vector3(
+                SafeReciprocal(scale.x),
+                SafeReciprocal(scale.y),
+                SafeReciprocal(scale.z));
+        }
+
+        private static Vector3 Abs(Vector3 value)
+        {
+            return new Vector3(Mathf.Abs(value.x), Mathf.Abs(value.y), Mathf.Abs(value.z));
+        }
+
+        private static float SafeReciprocal(float value)
+        {
+            return Mathf.Abs(value) <= Mathf.Epsilon ? 1f : 1f / value;
+        }
+    }
+}
+
+namespace MeshGeneration.SurfacePartitioning
+{
+    internal sealed class SurfacePartitionRegion
+    {
+        public readonly HashSet<Vector2Int> Cells = new HashSet<Vector2Int>();
+        public int SourceRectangleCount;
+        public float MaxSourceRectangleAspect;
+    }
+
+    internal sealed class SurfacePartition
+    {
+        public readonly int Columns;
+        public readonly int Rows;
+        public readonly IReadOnlyList<SurfacePartitionRegion> Regions;
+
+        public SurfacePartition(int columns, int rows, IReadOnlyList<SurfacePartitionRegion> regions)
+        {
+            Columns = columns;
+            Rows = rows;
+            Regions = regions;
+        }
+    }
+
+    internal static class SurfacePartitionGenerator
+    {
+        public static SurfacePartition Generate(float surfaceAspect, int pieceCount, float complexPieceRatio,
+            int maxRectanglesPerPiece, float maxComplexLegAspect, float maxPieceAspect,
+            int targetCellsPerRectangle, int seed,
+            float minAreaRatio = SurfacePartitionDefinition.DefaultMinAreaRatio,
+            float maxAreaRatio = SurfacePartitionDefinition.DefaultMaxAreaRatio,
+            float minLegRatio = SurfacePartitionDefinition.DefaultMinLegRatio)
+        {
+            if (TryGenerate(surfaceAspect, pieceCount, complexPieceRatio, maxRectanglesPerPiece,
+                maxComplexLegAspect, maxPieceAspect, targetCellsPerRectangle, seed,
+                minAreaRatio, maxAreaRatio, minLegRatio, out SurfacePartition partition)) return partition;
+            throw new InvalidOperationException($"No feasible rectangular partition for {pieceCount} pieces with the specified quality limits.");
+        }
+
+        internal static bool TryGenerate(float surfaceAspect, int pieceCount, float complexPieceRatio,
+            int maxRectanglesPerPiece, float maxComplexLegAspect, float maxPieceAspect,
+            int targetCellsPerRectangle, int seed, float minAreaRatio, float maxAreaRatio,
+            float minLegRatio, out SurfacePartition partition)
+        {
+            partition = null;
+            if (!ValidSettings(pieceCount, minAreaRatio, maxAreaRatio, minLegRatio) ||
+                float.IsNaN(surfaceAspect) || float.IsInfinity(surfaceAspect) || surfaceAspect <= 0f)
+                return false;
+            long requiredCells = (long)pieceCount * Mathf.Max(6, targetCellsPerRectangle);
+            int columns = Mathf.Max(1, Mathf.CeilToInt(Mathf.Sqrt(requiredCells * surfaceAspect)));
+            int rows = Mathf.Max(1, Mathf.CeilToInt(requiredCells / (float)columns));
+            if ((long)columns * rows > 4000000) return false;
+            return new BalancedPartitionPlanner(null, columns, rows, pieceCount,
+                maxRectanglesPerPiece < 2 ? 0f : complexPieceRatio, maxComplexLegAspect, maxPieceAspect,
+                seed, minAreaRatio, maxAreaRatio, minLegRatio).TryBuild(pieceCount, out partition);
+        }
+
+        internal static bool ValidSettings(int count, float minArea, float maxArea, float minLeg)
+        {
+            return count > 0 && count <= 100000 && minArea > 0f && minArea <= 1f &&
+                maxArea >= 1f && maxArea <= 3f && minLeg > 0f && minLeg <= 0.5f;
+        }
+
+        internal static int CountConcaveCorners(ICollection<Vector2Int> cells)
+        {
+            return CountConcaveCorners(cells, Array.Empty<Vector2Int>());
+        }
+
+        private static int CountConcaveCorners(ICollection<Vector2Int> first,
+            ICollection<Vector2Int> second)
+        {
+            BoundsInt bounds = CalculateBounds(first, second);
+            int count = 0;
+            for (int z = bounds.yMin; z <= bounds.yMax; z++)
+            for (int x = bounds.xMin; x <= bounds.xMax; x++)
+            {
+                int occupied = 0;
+                if (Contains(first, second, x - 1, z - 1)) occupied++;
+                if (Contains(first, second, x, z - 1)) occupied++;
+                if (Contains(first, second, x - 1, z)) occupied++;
+                if (Contains(first, second, x, z)) occupied++;
+                if (occupied == 3) count++;
+            }
+            return count;
+        }
+
+        private static bool Contains(ICollection<Vector2Int> first,
+            ICollection<Vector2Int> second, int x, int z)
+        {
+            Vector2Int cell = new Vector2Int(x, z);
+            return first.Contains(cell) || second.Contains(cell);
+        }
+
+        internal static float CalculateAspect(IEnumerable<Vector2Int> cells)
+        {
+            BoundsInt bounds = CalculateBounds(cells, Array.Empty<Vector2Int>());
+            int shortest = Mathf.Max(1, Mathf.Min(bounds.size.x, bounds.size.y));
+            return Mathf.Max(bounds.size.x, bounds.size.y) / (float)shortest;
+        }
+
+        private static BoundsInt CalculateBounds(IEnumerable<Vector2Int> first, IEnumerable<Vector2Int> second)
+        {
+            int minX = int.MaxValue;
+            int minY = int.MaxValue;
+            int maxX = int.MinValue;
+            int maxY = int.MinValue;
+            AccumulateBounds(first, ref minX, ref minY, ref maxX, ref maxY);
+            AccumulateBounds(second, ref minX, ref minY, ref maxX, ref maxY);
+            return new BoundsInt(minX, minY, 0, maxX - minX + 1, maxY - minY + 1, 1);
+        }
+
+        private static void AccumulateBounds(IEnumerable<Vector2Int> cells, ref int minX, ref int minY,
+            ref int maxX, ref int maxY)
+        {
+            foreach (Vector2Int cell in cells)
+            {
+                minX = Mathf.Min(minX, cell.x);
+                minY = Mathf.Min(minY, cell.y);
+                maxX = Mathf.Max(maxX, cell.x);
+                maxY = Mathf.Max(maxY, cell.y);
+            }
+        }
+
+    }
+}
