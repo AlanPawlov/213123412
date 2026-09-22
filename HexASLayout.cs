@@ -19,6 +19,9 @@ public sealed class HexASLayout : MonoBehaviour
     [Min(0f)] [SerializeField] private float rowGap = 0.25f;
     [Range(0.01f, 1f)] [SerializeField] private float minUniformScale = 0.35f;
 
+    [Header("Two AS diagonal arrangement")]
+    [Range(0f, 1f)] [SerializeField] private float twoItemSideOffset = 0.65f;
+
     [Header("Organic displacement")]
     [Range(0f, 0.5f)] [SerializeField] private float jitterFraction = 0.12f;
     [Min(1)] [SerializeField] private int jitterAttempts = 24;
@@ -201,6 +204,13 @@ public sealed class HexASLayout : MonoBehaviour
                                     columnGap * 0.35f);
                 float jz = Mathf.Min(item.Footprint.height * best.Factor * jitterFraction,
                                     rowGap * 0.35f);
+                if (items.Count == 2)
+                {
+                    // Do not let random movement undo the deliberately opposite
+                    // left/right placement (or put either AS across the center).
+                    float footprintCenterX = item.X + item.Footprint.center.x * best.Factor;
+                    jx = Mathf.Min(jx, Mathf.Abs(footprintCenterX - center.x) * 0.25f);
+                }
                 // With no requested gap the displacement may remain zero: this is
                 // intentional, as it avoids silently sacrificing separation.
                 for (int attempt = 0; attempt < jitterAttempts; attempt++)
@@ -264,9 +274,73 @@ public sealed class HexASLayout : MonoBehaviour
                 cursor += item.Footprint.width * factor + columnGap;
             }
         }
+        // For exactly two systems: one AS per row, far one toward +X and
+        // near one toward -X, like two opposite corners of the hex.
+        // A safe maximum side shift is found against the actual mesh outline.
+        if (sorted.Count == 2 && profile.Length == 2 &&
+            profile[0] == 1 && profile[1] == 1)
+        {
+            if (!ArrangeTwoOpposite(rows[0].Items[0], rows[1].Items[0],
+                                    factor, hull))
+                return null;
+        }
+
         foreach (Item item in sorted)
             if (!ValidItem(item, factor, sorted, hull)) return null;
         return new Layout { Rows = rows, Factor = factor };
+    }
+
+    /// <summary>
+    /// Two separate rows: the larger AS has already been assigned to the far
+    /// (+Z) row, so place it to the right (+X); place the near row to the left.
+    /// The amount of lateral offset is relative to the maximum allowed by the
+    /// REAL convex mesh footprint, not the mesh's rectangular bounds.
+    /// </summary>
+    private bool ArrangeTwoOpposite(Item far, Item near, float factor,
+                                    List<Vector2> hull)
+    {
+        if (!FitsInsideHex(far, factor, hull) ||
+            !FitsInsideHex(near, factor, hull))
+            return false;
+
+        far.X += MaxSafeSideShift(far, factor, hull, +1f) * twoItemSideOffset;
+        near.X -= MaxSafeSideShift(near, factor, hull, -1f) * twoItemSideOffset;
+        return true;
+    }
+
+    private float MaxSafeSideShift(Item item, float factor,
+                                   List<Vector2> hull, float direction)
+    {
+        float minX = float.PositiveInfinity, maxX = float.NegativeInfinity;
+        foreach (Vector2 vertex in hull)
+        {
+            minX = Mathf.Min(minX, vertex.x);
+            maxX = Mathf.Max(maxX, vertex.x);
+        }
+        float low = 0f;
+        float high = maxX - minX;
+        float initialX = item.X;
+
+        // Starting position is known to be inside. Convexity guarantees that
+        // feasible horizontal offsets form a continuous interval.
+        for (int attempt = 0; attempt < 24; attempt++)
+        {
+            float mid = (low + high) * 0.5f;
+            item.X = initialX + direction * mid;
+            if (FitsInsideHex(item, factor, hull)) low = mid;
+            else high = mid;
+        }
+        item.X = initialX;
+        return low;
+    }
+
+    private bool FitsInsideHex(Item item, float factor, List<Vector2> hull)
+    {
+        Rect rect = At(item, factor);
+        return InsideConvexWithMargin(new Vector2(rect.xMin, rect.yMin), hull, boundaryMargin) &&
+               InsideConvexWithMargin(new Vector2(rect.xMin, rect.yMax), hull, boundaryMargin) &&
+               InsideConvexWithMargin(new Vector2(rect.xMax, rect.yMin), hull, boundaryMargin) &&
+               InsideConvexWithMargin(new Vector2(rect.xMax, rect.yMax), hull, boundaryMargin);
     }
 
     private bool ValidItem(Item item, float factor, List<Item> all, List<Vector2> hull)
@@ -474,7 +548,7 @@ public sealed class HexASLayout : MonoBehaviour
     {
         null,
         new[] { 1 },
-        new[] { 2 },
+        new[] { 1, 1 },
         new[] { 1, 2 },
         new[] { 1, 2, 1 },
         new[] { 1, 3, 1 },
