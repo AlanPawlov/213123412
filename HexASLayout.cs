@@ -24,6 +24,9 @@ public sealed class HexASLayout : MonoBehaviour
     [Min(1)] [SerializeField] private int jitterAttempts = 24;
     [SerializeField] private int randomSeed = 12345;
 
+    [Header("Diagnostics")]
+    [SerializeField] private bool logChosenProfile = false;
+
     private readonly Dictionary<Transform, Vector3> originalScales = new Dictionary<Transform, Vector3>();
     private const float Eps = 0.0001f;
 
@@ -126,8 +129,9 @@ public sealed class HexASLayout : MonoBehaviour
             }
         }
 
-        // First try ALL candidate profiles at factor 1. Do not shrink objects
-        // merely because one particularly attractive profile does not fit.
+        // Shape has priority over size for N <= 12: try to shrink the
+        // PRESET before considering any alternative profile. This prevents
+        // 7 objects from turning into 7 single-object rows just to keep scale 1.
         items.Sort((a, b) =>
         {
             int byScale = b.ScaleKey.CompareTo(a.ScaleKey);
@@ -135,39 +139,45 @@ public sealed class HexASLayout : MonoBehaviour
             return (b.Footprint.width * b.Footprint.height)
                 .CompareTo(a.Footprint.width * a.Footprint.height);
         });
-        List<int[]> profiles = CandidateProfiles(items.Count);
-        Layout best = null;
-        for (int p = 0; p < profiles.Count; p++)
-        {
-            Layout test = TryPack(items, profiles[p], 1f, hull, center);
-            if (test != null) { test.Priority = p; best = test; break; }
-        }
 
-        // If full scale fails, search for the maximum shared factor for EVERY
-        // candidate, then select the one that preserves the most scale.
-        if (best == null)
+        List<int[]> profiles = CandidateProfiles(items.Count);
+        float lowerLimit = Mathf.Clamp(minUniformScale, 0.01f, 1f);
+        Layout best = null;
+
+        if (items.Count <= 12)
         {
-            float lowerLimit = Mathf.Clamp(minUniformScale, 0.01f, 1f);
-            float largestFactor = -1f;
+            // Only proceed to an alternative if the preset cannot fit even
+            // at the minimum allowed shared scale.
             for (int p = 0; p < profiles.Count; p++)
             {
-                Layout feasible = TryPack(items, profiles[p], lowerLimit, hull, center);
+                Layout feasible = FindLargestLayoutForProfile(
+                    items, profiles[p], hull, center, lowerLimit);
                 if (feasible == null) continue;
-                float lo = lowerLimit, hi = 1f;
-                for (int step = 0; step < 22; step++)
-                {
-                    float mid = (lo + hi) * 0.5f;
-                    Layout candidate = TryPack(items, profiles[p], mid, hull, center);
-                    if (candidate != null) { lo = mid; feasible = candidate; }
-                    else hi = mid;
-                }
-                if (lo > largestFactor + Eps ||
-                    (Mathf.Abs(lo - largestFactor) <= Eps && best != null && p < best.Priority))
-                {
-                    feasible.Priority = p;
+
+                feasible.Priority = p;
+                best = feasible;
+                if (p != 0)
+                    Debug.LogWarning(
+                        "HexASLayout: preferred profile " + ProfileName(profiles[0]) +
+                        " could not fit at the minimum uniform scale; using " +
+                        ProfileName(profiles[p]) + " instead.", this);
+                break;
+            }
+        }
+        else
+        {
+            // For a large automatically generated set, maximize the common
+            // scale; candidate order is the silhouette tie-breaker.
+            for (int p = 0; p < profiles.Count; p++)
+            {
+                Layout feasible = FindLargestLayoutForProfile(
+                    items, profiles[p], hull, center, lowerLimit);
+                if (feasible == null) continue;
+
+                feasible.Priority = p;
+                if (best == null || feasible.Factor > best.Factor + Eps ||
+                    (Mathf.Abs(feasible.Factor - best.Factor) <= Eps && p < best.Priority))
                     best = feasible;
-                    largestFactor = lo;
-                }
             }
         }
         if (best == null)
@@ -176,6 +186,10 @@ public sealed class HexASLayout : MonoBehaviour
                              "Increase hex size, lower spacing/margin or minUniformScale.", this);
             return false;
         }
+
+        if (logChosenProfile)
+            Debug.Log("HexASLayout: profile " + ProfileName(profiles[best.Priority]) +
+                      ", uniform scale factor " + best.Factor.ToString("F3") + ".", this);
 
         // Jitter a copy of the finished layout, retaining only valid proposals.
         var random = new System.Random(randomSeed);
@@ -418,8 +432,44 @@ public sealed class HexASLayout : MonoBehaviour
         return new Vector3(current.x + wx, current.y, current.z + wz);
     }
 
-    // Presets are listed far (+Z) to near (-Z). Alternative profiles are used
-    // before any shrinking; for >12 AS all profiles are generated automatically.
+    /// <summary>
+    /// Finds the largest common scale for ONE given profile. The caller controls
+    /// profile priority, so a preferred silhouette is not discarded at factor 1.
+    /// No scene Transform is mutated by TryPack / this method.
+    /// </summary>
+    private Layout FindLargestLayoutForProfile(List<Item> items, int[] profile,
+                                               List<Vector2> hull, Vector2 center,
+                                               float minimumFactor)
+    {
+        Layout fullSize = TryPack(items, profile, 1f, hull, center);
+        if (fullSize != null) return fullSize;
+
+        Layout feasible = TryPack(items, profile, minimumFactor, hull, center);
+        if (feasible == null) return null;
+
+        float lo = minimumFactor;
+        float hi = 1f;
+        for (int iteration = 0; iteration < 22; iteration++)
+        {
+            float mid = (lo + hi) * 0.5f;
+            Layout test = TryPack(items, profile, mid, hull, center);
+            if (test != null)
+            {
+                feasible = test;
+                lo = mid;
+            }
+            else hi = mid;
+        }
+        return feasible;
+    }
+
+    private static string ProfileName(int[] profile)
+    {
+        return "[" + string.Join(",", Array.ConvertAll(profile, value => value.ToString())) + "]";
+    }
+
+    // Presets are listed far (+Z) to near (-Z). For <=12, ALWAYS try the
+    // preferred profile at every allowed scale before considering alternatives.
     private static readonly int[][] Presets =
     {
         null,
@@ -443,15 +493,48 @@ public sealed class HexASLayout : MonoBehaviour
         var keys = new HashSet<string>();
         Action<int[]> add = profile =>
         {
-            string key = string.Join(",", Array.ConvertAll(profile, v => v.ToString()));
+            string key = ProfileName(profile);
             if (keys.Add(key)) result.Add(profile);
         };
+
         if (count <= 12) add(Presets[count]);
-        // For large N, R near sqrt(N) gives a reasonable range; other candidates
-        // make it robust when wide bases demand more / fewer rows.
-        int maxRows = count <= 12 ? count : Mathf.Min(count, Mathf.CeilToInt(2.2f * Mathf.Sqrt(count)) + 3);
-        for (int r = 1; r <= maxRows; r++) add(GenerateProfile(count, r));
+        int maxRows = count <= 12 ? count :
+            Mathf.Min(count, Mathf.CeilToInt(2.2f * Mathf.Sqrt(count)) + 3);
+        var alternatives = new List<int[]>();
+        for (int r = 1; r <= maxRows; r++)
+        {
+            int[] profile = GenerateProfile(count, r);
+            if (keys.Add(ProfileName(profile))) alternatives.Add(profile);
+        }
+
+        // Prefer a row count near the preset (or sqrt(N) for large sets), then
+        // symmetry and few singleton rows. In particular [1,1,1,1,1,1,1]
+        // is an extreme fallback, not the first alternative for seven objects.
+        int targetRows = count <= 12 ? Presets[count].Length :
+            Mathf.Max(1, Mathf.RoundToInt(Mathf.Sqrt(count)));
+        alternatives.Sort((a, b) =>
+        {
+            float sa = ProfilePenalty(a, targetRows);
+            float sb = ProfilePenalty(b, targetRows);
+            int comparison = sa.CompareTo(sb);
+            return comparison != 0 ? comparison : a.Length.CompareTo(b.Length);
+        });
+        result.AddRange(alternatives);
         return result;
+    }
+
+    private static float ProfilePenalty(int[] profile, int targetRows)
+    {
+        float score = Mathf.Abs(profile.Length - targetRows) * 10f;
+        for (int i = 0; i < profile.Length; i++)
+        {
+            if (profile[i] == 1 && profile.Length > 1) score += 1.5f;
+            score += Mathf.Abs(profile[i] - profile[profile.Length - 1 - i]);
+            if (i < profile.Length / 2 && profile[i] > profile[i + 1]) score += 3f;
+            if (i >= (profile.Length + 1) / 2 && i > 0 &&
+                profile[i] > profile[i - 1]) score += 3f;
+        }
+        return score;
     }
 
     private static int[] GenerateProfile(int count, int rowCount)
