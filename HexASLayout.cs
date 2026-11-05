@@ -19,7 +19,7 @@ public sealed class HexASLayout : MonoBehaviour
 	private float boundaryMargin = 0.10f;
 
 	[Header("Spacing (hex local units)")]
-	[Tooltip("Minimum gap before the common scale; multi-item rows expand it to fill the safe width.")]
+	[Tooltip("Minimum gap before the common scale. Multi-item rows use equal gaps between bounds and to both side walls.")]
 	[Min(0f)]
 	[SerializeField]
 	private float columnGap = 0.20f;
@@ -337,7 +337,7 @@ public sealed class HexASLayout : MonoBehaviour
 			}
 
 			// Singletons keep the centered placement above. Every larger row
-			// uses the maximum feasible equal gap between its actual bounds.
+			// uses equal gaps between bounds AND to the two side walls.
 			if (row.Items.Count > 1 && !SpreadRowEvenly(row, factor, hull))
 				return null;
 		}
@@ -362,9 +362,10 @@ public sealed class HexASLayout : MonoBehaviour
 	}
 
 	/// <summary>
-	/// Maximizes one common gap between consecutive bounds while preserving
-	/// item order and Z. Each item's own depth determines its allowed X range;
-	/// a deep middle item does not unnecessarily restrict shallower end items.
+	/// Uses one common horizontal gap between consecutive bounds AND between
+	/// each end bound and its side wall. Wall positions account for the full
+	/// depth of the corresponding end bound. Margin is a safety constraint,
+	/// not extra space added only to the two outer gaps.
 	/// </summary>
 	private bool SpreadRowEvenly(Row row, float factor, List<Vector2> hull)
 	{
@@ -372,73 +373,58 @@ public sealed class HexASLayout : MonoBehaviour
 		if (count <= 1)
 			return true;
 
-		// If S is the first left edge, P_i the sum of preceding widths,
-		// and G the common gap, item i starts at S + P_i + i * G.
-		// Its constraints become lower[i] - i*G <= S <= upper[i] - i*G.
-		var lower = new double[count];
-		var upper = new double[count];
-		double precedingWidth = 0.0;
-		for (int i = 0; i < count; i++)
-		{
-			Rect rect = At(row.Items[i], factor);
-			double left, right;
-			if (!TryGetHorizontalSpan(rect.yMin, rect.yMax, hull, out left, out right))
-				return false;
-
-			lower[i] = left - precedingWidth;
-			upper[i] = right - rect.width - precedingWidth;
-			if (lower[i] > upper[i])
-				return false;
-			precedingWidth += rect.width;
-		}
-
-		double minGap = columnGap * factor;
-		double maxGap = double.PositiveInfinity;
-		for (int i = 0; i < count; i++)
-		for (int j = i + 1; j < count; j++)
-		{
-			double steps = j - i;
-			maxGap = Math.Min(maxGap, (upper[j] - lower[i]) / steps);
-			minGap = Math.Max(minGap, (lower[j] - upper[i]) / steps);
-		}
-
-		if (maxGap < minGap)
+		Rect first = At(row.Items[0], factor);
+		Rect last = At(row.Items[count - 1], factor);
+		double leftWall, rightWall, unused;
+		// Measure the physical walls before applying boundaryMargin, otherwise
+		// only the outer gaps would receive an extra margin and become unequal.
+		if (!TryGetHorizontalSpan(first.yMin, first.yMax, hull, 0.0,
+			    out leftWall, out unused) ||
+		    !TryGetHorizontalSpan(last.yMin, last.yMax, hull, 0.0,
+			    out unused, out rightWall))
 			return false;
 
-		double startMin = double.NegativeInfinity;
-		double startMax = double.PositiveInfinity;
-		for (int i = 0; i < count; i++)
-		{
-			startMin = Math.Max(startMin, lower[i] - i * maxGap);
-			startMax = Math.Min(startMax, upper[i] - i * maxGap);
-		}
+		double totalWidth = 0.0;
+		foreach (Item item in row.Items)
+			totalWidth += item.Footprint.width * factor;
 
-		// The span has a small safety inset; allow only rounding-sized
-		// differences when the feasible start interval collapses to a point.
-		if (startMin > startMax + Eps)
+		// N bounds create N+1 equal gaps: two outer gaps and N-1 inner gaps.
+		double gap = (rightWall - leftWall - totalWidth) / (count + 1);
+		if (gap < columnGap * factor)
 			return false;
 
-		double cursor = (startMin + startMax) * 0.5;
+		double cursor = leftWall + gap;
 		foreach (Item item in row.Items)
 		{
+			Rect rect = At(item, factor);
+			double safeLeft, safeRight;
+			if (!TryGetHorizontalSpan(rect.yMin, rect.yMax, hull,
+				    (double)boundaryMargin + Eps, out safeLeft, out safeRight))
+				return false;
+
+			// An interior item can be deeper than the end items. Check its
+			// own limits as well; the caller reduces the shared scale if needed.
+			if (cursor < safeLeft || cursor + rect.width > safeRight)
+				return false;
+
 			// Position the left bound, not the transform pivot.
 			item.X = (float)(cursor - item.Footprint.xMin * factor);
-			cursor += item.Footprint.width * factor + maxGap;
+			cursor += rect.width + gap;
 		}
 
 		return true;
 	}
 
 	/// <summary>
-	/// Returns the X interval inside the inset convex hull for the ENTIRE
-	/// [zMin, zMax] band. Hull vertices must be counter-clockwise.
+	/// Returns the X interval inside the convex hull for the ENTIRE [zMin, zMax]
+	/// band, inset by the supplied margin. Use zero to measure the physical walls.
+	/// Hull vertices must be counter-clockwise.
 	/// </summary>
 	private bool TryGetHorizontalSpan(float zMin, float zMax,
-		List<Vector2> hull, out double left, out double right)
+		List<Vector2> hull, double margin, out double left, out double right)
 	{
 		left = double.NegativeInfinity;
 		right = double.PositiveInfinity;
-		double margin = boundaryMargin + Eps;
 
 		for (int i = 0; i < hull.Count; i++)
 		{
