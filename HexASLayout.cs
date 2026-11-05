@@ -1,3 +1,4 @@
+
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -18,6 +19,7 @@ public sealed class HexASLayout : MonoBehaviour
 	private float boundaryMargin = 0.10f;
 
 	[Header("Spacing (hex local units)")]
+	[Tooltip("Minimum gap before the common scale; multi-item rows expand it to fill the safe width.")]
 	[Min(0f)]
 	[SerializeField]
 	private float columnGap = 0.20f;
@@ -28,16 +30,12 @@ public sealed class HexASLayout : MonoBehaviour
 	[SerializeField]
 	private bool enableDiagonalArrangement;
 	[Header("Two AS diagonal arrangement")]
-	[Range(0f, 2f)]
+	[Range(0f, 1f)]
 	[SerializeField]
 	private float twoItemSideOffset = 0.65f;
 
-	[Header("Two AS in one row")]
-	[Range(0f, 1f)]
-	[SerializeField]
-	private float twoItemInRowOffset = 0.65f;
-
 	[Header("Organic displacement")]
+	[Tooltip("Applied only to singleton rows so multi-item gaps remain equal.")]
 	[Range(0f, 0.5f)]
 	[SerializeField]
 	private float jitterFraction = 0.12f;
@@ -232,11 +230,15 @@ public sealed class HexASLayout : MonoBehaviour
 			Debug.Log("HexASLayout: profile " + ProfileName(profiles[best.Priority]) +
 			          ", uniform scale factor " + best.Factor.ToString("F3") + ".", this);
 
-		// Jitter a copy of the finished layout, retaining only valid proposals.
+		// Keep equal gaps in multi-item rows. Preserve organic displacement
+		// for singleton rows, retaining only valid proposals.
 		var random = new System.Random(randomSeed);
 		foreach (Row row in best.Rows)
-		foreach (Item item in row.Items)
 		{
+			if (row.Items.Count > 1)
+				continue;
+
+			Item item = row.Items[0];
 			float baseX = item.X, baseZ = item.Z;
 			float jx = Mathf.Min(item.Footprint.width * best.Factor * jitterFraction,
 				columnGap * 0.35f);
@@ -264,6 +266,14 @@ public sealed class HexASLayout : MonoBehaviour
 				item.Z = baseZ;
 			}
 		}
+
+		// Commit only a fully validated layout, including any singleton jitter.
+		foreach (Item item in items)
+			if (!ValidItem(item, best.Factor, items, hull))
+			{
+				Debug.LogWarning("HexASLayout: final layout failed bounds/overlap validation.", this);
+				return false;
+			}
 
 		// Only NOW mutate the scene. Preserve each root's original world Y.
 		foreach (Item item in items)
@@ -325,6 +335,11 @@ public sealed class HexASLayout : MonoBehaviour
 				item.Z = row.CenterZ - item.Footprint.center.y * factor;
 				cursor += item.Footprint.width * factor + scaledColumnGap;
 			}
+
+			// Singletons keep the centered placement above. Every larger row
+			// uses the maximum feasible equal gap between its actual bounds.
+			if (row.Items.Count > 1 && !SpreadRowEvenly(row, factor, hull))
+				return null;
 		}
 
 		// For exactly two systems: one AS per row, far one toward +X and
@@ -338,21 +353,117 @@ public sealed class HexASLayout : MonoBehaviour
 				return null;
 		}
 
-		if (sorted.Count == 3 || sorted.Count == 4)
-		{
-			if (!ArrangeTwoInOneRow(rows[1].Items[0], rows[1].Items[1],
-				    factor, hull))
+		// Special arrangements must pass the same checks as every other row.
+		foreach (Item item in sorted)
+			if (!ValidItem(item, factor, sorted, hull))
 				return null;
-		}
-
-		if (!(enableDiagonalArrangement && sorted.Count == 2 && profile.Length == 2 && profile[0] == 1 &&
-		      profile[1] == 1) &&
-		    !(sorted.Count == 3 || sorted.Count == 4))
-			foreach (Item item in sorted)
-				if (!ValidItem(item, factor, sorted, hull))
-					return null;
 
 		return new Layout {Rows = rows, Factor = factor};
+	}
+
+	/// <summary>
+	/// Maximizes one common gap between consecutive bounds while preserving
+	/// item order and Z. Each item's own depth determines its allowed X range;
+	/// a deep middle item does not unnecessarily restrict shallower end items.
+	/// </summary>
+	private bool SpreadRowEvenly(Row row, float factor, List<Vector2> hull)
+	{
+		int count = row.Items.Count;
+		if (count <= 1)
+			return true;
+
+		// If S is the first left edge, P_i the sum of preceding widths,
+		// and G the common gap, item i starts at S + P_i + i * G.
+		// Its constraints become lower[i] - i*G <= S <= upper[i] - i*G.
+		var lower = new double[count];
+		var upper = new double[count];
+		double precedingWidth = 0.0;
+		for (int i = 0; i < count; i++)
+		{
+			Rect rect = At(row.Items[i], factor);
+			double left, right;
+			if (!TryGetHorizontalSpan(rect.yMin, rect.yMax, hull, out left, out right))
+				return false;
+
+			lower[i] = left - precedingWidth;
+			upper[i] = right - rect.width - precedingWidth;
+			if (lower[i] > upper[i])
+				return false;
+			precedingWidth += rect.width;
+		}
+
+		double minGap = columnGap * factor;
+		double maxGap = double.PositiveInfinity;
+		for (int i = 0; i < count; i++)
+		for (int j = i + 1; j < count; j++)
+		{
+			double steps = j - i;
+			maxGap = Math.Min(maxGap, (upper[j] - lower[i]) / steps);
+			minGap = Math.Max(minGap, (lower[j] - upper[i]) / steps);
+		}
+
+		if (maxGap < minGap)
+			return false;
+
+		double startMin = double.NegativeInfinity;
+		double startMax = double.PositiveInfinity;
+		for (int i = 0; i < count; i++)
+		{
+			startMin = Math.Max(startMin, lower[i] - i * maxGap);
+			startMax = Math.Min(startMax, upper[i] - i * maxGap);
+		}
+
+		// The span has a small safety inset; allow only rounding-sized
+		// differences when the feasible start interval collapses to a point.
+		if (startMin > startMax + Eps)
+			return false;
+
+		double cursor = (startMin + startMax) * 0.5;
+		foreach (Item item in row.Items)
+		{
+			// Position the left bound, not the transform pivot.
+			item.X = (float)(cursor - item.Footprint.xMin * factor);
+			cursor += item.Footprint.width * factor + maxGap;
+		}
+
+		return true;
+	}
+
+	/// <summary>
+	/// Returns the X interval inside the inset convex hull for the ENTIRE
+	/// [zMin, zMax] band. Hull vertices must be counter-clockwise.
+	/// </summary>
+	private bool TryGetHorizontalSpan(float zMin, float zMax,
+		List<Vector2> hull, out double left, out double right)
+	{
+		left = double.NegativeInfinity;
+		right = double.PositiveInfinity;
+		double margin = boundaryMargin + Eps;
+
+		for (int i = 0; i < hull.Count; i++)
+		{
+			Vector2 a = hull[i], b = hull[(i + 1) % hull.Count];
+			double dx = (double)b.x - a.x;
+			double dz = (double)b.y - a.y;
+			double length = Math.Sqrt(dx * dx + dz * dz);
+			if (length < Eps)
+				continue;
+
+			// Inward unit normal: nx*x + nz*z >= dot(normal, a) + margin.
+			double nx = -dz / length;
+			double nz = dx / length;
+			double worstZ = nz >= 0.0 ? zMin : zMax;
+			double required = margin + nx * a.x + nz * a.y - nz * worstZ;
+
+			if (nx > 0.0)
+				left = Math.Max(left, required / nx);
+			else if (nx < 0.0)
+				right = Math.Min(right, required / nx);
+			else if (required > 0.0)
+				return false;
+		}
+
+		return left <= right && !double.IsInfinity(left) && !double.IsInfinity(right);
 	}
 
 	/// <summary>
@@ -364,16 +475,13 @@ public sealed class HexASLayout : MonoBehaviour
 	private bool ArrangeTwoOpposite(Item far, Item near, float factor,
 		List<Vector2> hull)
 	{
-		far.X += MaxSafeSideShift(far, factor, hull, +1f) * twoItemSideOffset;
-		near.X -= MaxSafeSideShift(near, factor, hull, -1f) * twoItemSideOffset;
-		return true;
-	}
+		// MaxSafeSideShift requires an initially valid footprint.
+		if (!FitsInsideHex(far, factor, hull) || !FitsInsideHex(near, factor, hull))
+			return false;
 
-	private bool ArrangeTwoInOneRow(Item far, Item near, float factor,
-		List<Vector2> hull)
-	{
-		far.X += MaxSafeSideShift(far, factor, hull, +1f) * twoItemInRowOffset;
-		near.X -= MaxSafeSideShift(near, factor, hull, -1f) * twoItemInRowOffset;
+		float offset = Mathf.Clamp01(twoItemSideOffset);
+		far.X += MaxSafeSideShift(far, factor, hull, +1f) * offset;
+		near.X -= MaxSafeSideShift(near, factor, hull, -1f) * offset;
 		return true;
 	}
 
@@ -615,8 +723,7 @@ public sealed class HexASLayout : MonoBehaviour
 		if (fullSize != null)
 			return fullSize;
 
-		Layout feasible = TryPack(items, profile, minimumFactor, hull, center);
-		if (feasible == null)
+		if (TryPack(items, profile, minimumFactor, hull, center) == null)
 			return null;
 
 		float lo = minimumFactor;
@@ -627,14 +734,15 @@ public sealed class HexASLayout : MonoBehaviour
 			Layout test = TryPack(items, profile, mid, hull, center);
 			if (test != null)
 			{
-				feasible = test;
 				lo = mid;
 			}
 			else
 				hi = mid;
 		}
 
-		return feasible;
+		// TryPack reuses the same Item objects. A later rejected candidate
+		// overwrites their X/Z, so rebuild the last valid scale before returning.
+		return TryPack(items, profile, lo, hull, center);
 	}
 
 	private static string ProfileName(int[] profile)
@@ -752,3 +860,6 @@ public sealed class HexASLayout : MonoBehaviour
 		return profile;
 	}
 }
+
+
+
