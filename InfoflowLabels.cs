@@ -116,6 +116,10 @@ namespace Sbrt.Av.Gameplay
             var occupied = new List<Rect>(labels.Count);
             var blocked = new List<Vector2>();
             var up = plane.Normal;
+            // Базис LineRenderer: координаты маршрута X и Z лежат в его локальных X и Y.
+            var flowRotation = Quaternion.LookRotation(up, plane.Z);
+            var textAlongX = flowRotation * Quaternion.Euler(90f, 0f, 0f);
+            var textAlongY = flowRotation * Quaternion.Euler(0f, 90f, 90f);
             foreach (var label in labels)
             {
                 var chosen = label.Preferred;
@@ -141,11 +145,10 @@ namespace Sbrt.Av.Gameplay
                 footprint.position += UpInView * elevation;
                 occupied.Add(footprint);
 
-                var right = plane.X * chosen.Direction.x + plane.Z * chosen.Direction.y;
-                if (!chosen.AlongX) right = -right;
-                var rotation = Quaternion.LookRotation(Vector3.Cross(right, up), up);
+                var rotation = chosen.AlongX ? textAlongX : textAlongY;
                 var baseline = plane.World(chosen.At(position)) + up * (lift + elevation);
-                var origin = baseline - right * label.Glyphs.center.x - up * label.Glyphs.min.y;
+                var glyphOffset = new Vector3(label.Glyphs.center.x, label.Glyphs.min.y, 0f);
+                var origin = baseline - rotation * glyphOffset;
                 label.Text.transform.SetPositionAndRotation(origin, rotation);
             }
 
