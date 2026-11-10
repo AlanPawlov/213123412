@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using UnityEngine;
 
 namespace Sbrt.Av.Gameplay
@@ -22,10 +24,9 @@ namespace Sbrt.Av.Gameplay
         [SerializeField, HideInInspector] Material ownedMaterial;
         [SerializeField, HideInInspector] string summary;
         [SerializeField, HideInInspector] List<string> diagnostics = new List<string>();
-        // Исходные данные нужны только для повторного Generate в текущем сеансе.
-        // Для восстановления отображения после перезагрузки сохраняется рассчитанный lastResult.
         KafoDataModel sourceData;
-        List<InfoflowDataModel> sourceFlows;
+        // SourceIndex связывает каждую физическую линию с исходной записью даже после загрузки сцены.
+        [SerializeField, HideInInspector] List<InfoflowDataModel> sourceFlows;
 
         public GameObject GeneratedRoot => generatedRoot;
         public InfoflowRoutingResult LastResult => savedFormatVersion == InfoflowRoutingResult.CurrentVersion ? lastResult : null;
@@ -38,6 +39,63 @@ namespace Sbrt.Av.Gameplay
         public int RendererCount { get; private set; }
         public long MeshBytes { get; private set; }
         public long RendererMemoryBytes { get; private set; }
+
+        public List<LineRenderer> GetLineRenderersByAsId(long asId)
+        {
+            var lines = new List<LineRenderer>();
+            HashSet<string> savedEndpointKeys = null;
+            foreach (var record in registry)
+            {
+                var line = record.IndividualRenderer;
+                if (line == null) continue;
+
+                bool connected;
+                int index = record.SourceIndex;
+                if (sourceFlows != null && index >= 0 && index < sourceFlows.Count && sourceFlows[index] is InfoflowDataModel flow)
+                {
+                    connected = flow.ProviderId == asId || flow.ConsumerId == asId;
+                }
+                else
+                {
+                    // В старых сценах исходные потоки не сохранялись, но сохранились физические концы.
+                    savedEndpointKeys ??= SavedEndpointKeys(asId);
+                    connected = savedEndpointKeys.Contains(record.ProviderKey) || savedEndpointKeys.Contains(record.ConsumerKey);
+                }
+                if (connected) lines.Add(line);
+            }
+            return lines;
+        }
+
+        public List<LineRenderer> GetLineRenderersByFlowId(long flowId)
+        {
+            return registry.Where(record => record.FlowId == flowId && record.IndividualRenderer != null)
+                .Select(record => record.IndividualRenderer)
+                .ToList();
+        }
+
+        HashSet<string> SavedEndpointKeys(long asId)
+        {
+            var keys = new HashSet<string>(StringComparer.Ordinal);
+            if (sourceKafoRoot == null) return keys;
+
+            foreach (var item in sourceKafoRoot.GetComponentsInChildren<KafoGeneratedItem>(true))
+            {
+                if ((item.Kind != "AS" && item.Kind != "Bridge") ||
+                    string.IsNullOrEmpty(item.Key) || string.IsNullOrWhiteSpace(item.SourceRecord)) continue;
+
+                try
+                {
+                    var source = JToken.Parse(item.SourceRecord) as JObject;
+                    if (InfoflowSceneSnapshot.TryReadAsId(source, item.SystemKey, out long id) && id == asId)
+                        keys.Add(item.Key);
+                }
+                catch (JsonException)
+                {
+                    // Непрочитанная запись не может подтверждать ID физического конца.
+                }
+            }
+            return keys;
+        }
 
         public void Generate(KafoDataModel kafo, GameObject kafoRoot, IReadOnlyList<InfoflowDataModel> flows)
         {
@@ -55,7 +113,7 @@ namespace Sbrt.Av.Gameplay
             sourceData = kafo;
             sourceFlows = flows?.Select(f => f == null ? null : new InfoflowDataModel
             {
-                Id = f.Id, ProviderId = f.ProviderId, ConsumerId = f.ConsumerId
+                Id = f.Id, Name = f.Name, ProviderId = f.ProviderId, ConsumerId = f.ConsumerId
             }).ToList() ?? new List<InfoflowDataModel>();
             lastResult = result;
             planeXLocal = kafoRoot.transform.InverseTransformVector(plane.X);
@@ -97,6 +155,7 @@ namespace Sbrt.Av.Gameplay
             generatedRoot.AddComponent<InfoflowOutput>().Owner = this;
             IInfoflowRenderer renderer = UseBatchRendering ? (IInfoflowRenderer)new InfoflowBatchRenderer() : new InfoflowIndividualRenderer();
             renderer.Render(generatedRoot.transform, plane, lastResult, material, registry, ownedMeshes);
+            InfoflowLabels.Render(generatedRoot.transform, plane, lastResult, registry);
             var renderers = generatedRoot.GetComponentsInChildren<Renderer>();
             RendererCount = renderers.Length;
             RendererMemoryBytes = renderers.Sum(r => UnityEngine.Profiling.Profiler.GetRuntimeMemorySizeLong(r));
