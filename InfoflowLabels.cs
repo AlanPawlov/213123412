@@ -88,9 +88,8 @@ namespace Sbrt.Av.Gameplay
                     child.SetActive(false);
                     continue;
                 }
+                straights.Sort((a, b) => b.Length.CompareTo(a.Length));
                 var longest = straights[0];
-                foreach (var straight in straights)
-                    if (straight.Length > longest.Length) longest = straight;
                 straights.RemoveAll(s => s.Length < glyphs.size.x);
                 if (straights.Count == 0) straights.Add(longest);
                 labels.Add(new Label { Text = text, Glyphs = glyphs, Candidates = straights, Order = i });
@@ -123,8 +122,7 @@ namespace Sbrt.Av.Gameplay
             foreach (var label in labels)
             {
                 var chosen = label.Preferred;
-                float position = chosen.Length * .5f, elevation = 0;
-                bool placed = false;
+                float position = chosen.Length * .5f;
                 for (int i = 0; i < label.Candidates.Count; i++)
                 {
                     var straight = label.Candidates[i];
@@ -134,19 +132,13 @@ namespace Sbrt.Av.Gameplay
                         low, straight.Length - low, desired, out float free)) continue;
                     chosen = straight;
                     position = free;
-                    placed = true;
                     break;
                 }
-                // В плотном узле, где все подходящие отрезки заняты, поднимаем надпись
-                // на минимальную высоту, оставляя её над выбранным участком.
-                var footprint = Footprint(label, chosen, position);
-                if (!placed)
-                    FindFree(footprint, UpInView, 0, float.PositiveInfinity, 0, out elevation);
-                footprint.position += UpInView * elevation;
-                occupied.Add(footprint);
+                // Если все места заняты, подпись остаётся по центру длинного участка на общей высоте.
+                occupied.Add(Footprint(label, chosen, position));
 
                 var rotation = chosen.AlongX ? textAlongX : textAlongY;
-                var baseline = plane.World(chosen.At(position)) + up * (lift + elevation);
+                var baseline = plane.World(chosen.At(position)) + up * lift;
                 var glyphOffset = new Vector3(label.Glyphs.center.x, label.Glyphs.min.y, 0f);
                 var origin = baseline - rotation * glyphOffset;
                 label.Text.transform.SetPositionAndRotation(origin, rotation);
@@ -230,7 +222,6 @@ namespace Sbrt.Av.Gameplay
         {
             var result = new List<Straight>();
             int i = 0;
-            bool startsAtPort = false;
             int longest = -1;
             float longestSize = 0;
             while (i + 1 < points.Count)
@@ -259,14 +250,7 @@ namespace Sbrt.Av.Gameplay
                         break;
                     i++;
                 }
-                if (start == 0) startsAtPort = true;
                 result.Add(new Straight(points[start], points[i]));
-            }
-            if (startsAtPort && result.Count > 1)
-            {
-                var exit = result[0];
-                result.RemoveAt(0);
-                result.Add(exit);
             }
             if (result.Count == 0 && longest >= 0)
                 result.Add(new Straight(points[longest], points[longest + 1]));
