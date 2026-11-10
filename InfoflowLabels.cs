@@ -126,8 +126,9 @@ namespace Sbrt.Av.Gameplay
                 for (int i = 0; i < label.Candidates.Count; i++)
                 {
                     var straight = label.Candidates[i];
-                    float low = Mathf.Min(label.Glyphs.extents.x + padding, straight.Length * .5f);
-                    float desired = i == 0 && label.Stagger ? low : straight.Length * .5f;
+                    float middle = straight.Length * .5f;
+                    float low = Mathf.Min(label.Glyphs.extents.x, middle);
+                    float desired = i == 0 && label.Stagger ? Mathf.Min(low + padding, middle) : middle;
                     if (!FindFree(Footprint(label, straight, 0), straight.Direction,
                         low, straight.Length - low, desired, out float free)) continue;
                     chosen = straight;
